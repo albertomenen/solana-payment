@@ -37,6 +37,24 @@ Solo admite el programa SPL Token clásico (USDC, por ejemplo). No admite Token-
 porque extensiones como *transfer fee* o *permanent delegate* romperían las garantías
 del escrow.
 
+## Probarlo desde el móvil con Phantom (devnet)
+
+Cada push a `main` ejecuta `.github/workflows/devnet.yml`, que:
+1. Pasa los tests y compila el programa (SBF).
+2. Lo despliega en **devnet**. La primera vez, si el faucet automático falla, el
+   workflow espera y muestra un aviso con la dirección a la que enviar ~3 SOL de devnet
+   (desde https://faucet.solana.com).
+3. Publica la web (`app/`) en GitHub Pages.
+
+En el móvil:
+1. Phantom → Ajustes → Configuración de desarrollador → **Modo Testnet** → Solana Devnet.
+2. SOL de prueba en https://faucet.solana.com y USDC de prueba en https://faucet.circle.com.
+3. Abre la web de GitHub Pages **dentro del navegador de Phantom**, crea una apuesta y
+   comparte el enlace con tu amigo.
+
+Requisitos del repo (una vez): repositorio público y Settings → Pages → Source:
+**GitHub Actions**.
+
 ## Estructura
 
 ```
@@ -47,6 +65,9 @@ programs/wager/src/
 └── instructions/        # una instrucción por fichero
 programs/wager/tests/
 └── wager.rs             # tests de integración (solana-program-test)
+app/                     # web (React + Vite + wallet adapter)
+└── src/wager.ts         # cliente del programa (codificación Borsh a mano)
+.github/workflows/devnet.yml
 ```
 
 ## Desarrollo
@@ -68,7 +89,6 @@ terceros, redirigir el pago, aceptar una apuesta reservada a otra persona).
 
 ## Próximos pasos
 1. **Oráculo de precios (Pyth)** para apuestas como "BTC > 150k el 1 de enero".
-2. **Frontend** (Next.js + wallet adapter) con un enlace para compartir la apuesta.
-3. **Oráculo de eventos (Switchboard On-Demand)** para resultados deportivos.
-4. Auditoría antes de mainnet. Revisar también el marco legal (en España, la Ley 13/2011
+2. **Oráculo de eventos (Switchboard On-Demand)** para resultados deportivos.
+3. Auditoría antes de mainnet. Revisar también el marco legal (en España, la Ley 13/2011
    de regulación del juego).

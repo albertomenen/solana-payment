@@ -1,0 +1,153 @@
+# Compila y prueba en cada push. En `main`, además despliega el programa en
+# devnet y publica la web en GitHub Pages.
+name: Devnet
+
+on:
+  push:
+    branches: ["main", "claude/**"]
+  workflow_dispatch:
+
+concurrency:
+  group: devnet-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  DEPLOY: ${{ github.ref == 'refs/heads/main' }}
+
+jobs:
+  test:
+    name: Tests del programa
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test
+
+  program:
+    name: Compilar y desplegar el programa
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    outputs:
+      program_id: ${{ steps.keys.outputs.program_id }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Claves de devnet (deployer = autoridad de actualización). Se guardan en
+      # la caché de Actions para mantener el mismo program id entre despliegues.
+      - name: Restaurar claves de devnet
+        id: cache
+        uses: actions/cache/restore@v4
+        with:
+          path: .keys
+          key: devnet-keys-${{ github.run_id }}
+          restore-keys: devnet-keys-
+
+      - name: Instalar Solana CLI
+        run: |
+          sh -c "$(curl -sSfL https://release.anza.xyz/stable/install)"
+          echo "$HOME/.local/share/solana/install/active_release/bin" >> "$GITHUB_PATH"
+
+      - name: Preparar claves
+        id: keys
+        run: |
+          mkdir -p .keys
+          [ -f .keys/program.json ]  || solana-keygen new --no-bip39-passphrase --silent -o .keys/program.json
+          [ -f .keys/deployer.json ] || solana-keygen new --no-bip39-passphrase --silent -o .keys/deployer.json
+          PROGRAM_ID=$(solana-keygen pubkey .keys/program.json)
+          echo "program_id=$PROGRAM_ID" >> "$GITHUB_OUTPUT"
+          sed -i "s/declare_id!(\"[^\"]*\")/declare_id!(\"$PROGRAM_ID\")/" programs/wager/src/lib.rs
+          grep declare_id programs/wager/src/lib.rs
+
+      - name: Guardar claves
+        if: steps.cache.outputs.cache-matched-key == '' && env.DEPLOY == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: .keys
+          key: devnet-keys-${{ github.run_id }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: sbf
+
+      - name: Compilar (SBF)
+        run: cargo build-sbf --manifest-path programs/wager/Cargo.toml --sbf-out-dir target/deploy
+
+      - name: Desplegar en devnet
+        if: env.DEPLOY == 'true'
+        run: |
+          solana config set --url https://api.devnet.solana.com --keypair .keys/deployer.json
+          PROGRAM_ID=${{ steps.keys.outputs.program_id }}
+          SO=target/deploy/wager.so
+          SIZE=$(stat -c%s $SO)
+
+          if solana program show "$PROGRAM_ID" >/dev/null 2>&1; then
+            solana program dump "$PROGRAM_ID" /tmp/onchain.so
+            if cmp -s -n "$SIZE" "$SO" /tmp/onchain.so; then
+              echo "El programa desplegado ya está actualizado."
+              exit 0
+            fi
+          fi
+
+          ADDR=$(solana address)
+          NEED=$(( $(solana rent "$SIZE" --lamports | grep -oE '[0-9]+' | head -1) + 300000000 ))
+          balance() { solana balance --lamports | awk '{print $1}'; }
+
+          for i in 1 2 3; do
+            [ "$(balance)" -ge "$NEED" ] && break
+            solana airdrop 2 || true
+            sleep 5
+          done
+
+          # Si el faucet automático falla, espera a que alguien envíe SOL de devnet.
+          for i in $(seq 1 150); do
+            BAL=$(balance)
+            [ "$BAL" -ge "$NEED" ] && break
+            echo "::warning::Faltan SOL de devnet. Envía $(( (NEED - BAL) / 1000000000 + 1 )) SOL de devnet a $ADDR (faucet.solana.com)"
+            sleep 20
+          done
+          [ "$(balance)" -ge "$NEED" ] || { echo "::error::Sin fondos suficientes en $ADDR"; exit 1; }
+
+          solana program deploy "$SO" --program-id .keys/program.json --keypair .keys/deployer.json
+          echo "### Programa desplegado en devnet: \`$PROGRAM_ID\`" >> "$GITHUB_STEP_SUMMARY"
+
+  site:
+    name: Compilar la web
+    needs: program
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+      - name: Compilar
+        working-directory: app
+        env:
+          VITE_PROGRAM_ID: ${{ needs.program.outputs.program_id }}
+          BASE_PATH: /${{ github.event.repository.name }}/
+        run: |
+          npm ci
+          npm run build
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: app/dist
+
+  pages:
+    name: Publicar en GitHub Pages
+    if: github.ref == 'refs/heads/main'
+    needs: site
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - id: deploy
+        uses: actions/deploy-pages@v4

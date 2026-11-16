@@ -1,0 +1,39 @@
+[package]
+name = "wager"
+version = "0.1.0"
+description = "Apuestas P2P entre dos personas con escrow on-chain en Solana"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "wager"
+
+[features]
+default = []
+cpi = ["no-entrypoint"]
+no-entrypoint = []
+no-idl = []
+no-log-ix-name = []
+anchor-debug = []
+custom-heap = []
+custom-panic = []
+idl-build = ["anchor-lang/idl-build", "anchor-spl/idl-build"]
+
+[dependencies]
+anchor-lang = "1.2.2"
+anchor-spl = "1.2.2"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("solana"))'] }
+
+[dev-dependencies]
+solana-program-test = { version = "~4.2.2", features = ["agave-unstable-api"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+solana-keypair = "3.1"
+solana-signer = "3.0"
+solana-transaction = "4.1"
+solana-system-interface = { version = "3.2", features = ["bincode"] }
+# Anchor 1.2 usa solana-sysvar 3.x y solana-program-test 4.2 usa 4.x; los tests
+# conectan ambas versiones (ver `tests/wager.rs::bridge_syscall_stubs`).
+sysvar-v3 = { package = "solana-sysvar", version = "=3.1.1" }
+sysvar-v4 = { package = "solana-sysvar", version = "4.1" }

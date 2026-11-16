@@ -199,3 +199,106 @@ details.adv summary { color: var(--muted); font-size: 0.85rem; cursor: pointer; 
 .muted { color: var(--muted); }
 .center { text-align: center; }
 .spacer { height: 12px; }
+
+/* ================= animaciones ================= */
+:root {
+  --spring: cubic-bezier(0.34, 1.56, 0.64, 1);
+  --ease-out: cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+/* Pulsación: todo lo tocable se hunde un poco y rebota al soltar. */
+.btn, .chip, .action, .option, .icon-btn, .max-btn, .paste, .segmented button, .row-item,
+.wallet-adapter-button {
+  transition: transform 0.35s var(--spring), background-color 0.2s, border-color 0.2s, color 0.2s, opacity 0.2s !important;
+  touch-action: manipulation;
+  user-select: none;
+  -webkit-user-select: none;
+}
+.btn:not(:disabled):active, .action:active, .wallet-adapter-button:active { transform: scale(0.95); transition-duration: 0.08s !important; }
+.chip:active, .max-btn:active, .paste:active, .icon-btn:active { transform: scale(0.88); transition-duration: 0.08s !important; }
+.option:not(:disabled):active, .row-item:active { transform: scale(0.97); transition-duration: 0.08s !important; }
+.action .ic { transition: transform 0.4s var(--spring); }
+.action:active .ic { transform: scale(0.85) rotate(-8deg); }
+
+/* Selección de chips y opciones. */
+.chip.on { animation: pop 0.35s var(--spring); }
+.option .radio { transition: border-width 0.25s var(--spring), border-color 0.2s; }
+.option.on { animation: pop-soft 0.3s var(--spring); }
+@keyframes pop { 0% { transform: scale(0.85); } 100% { transform: scale(1); } }
+@keyframes pop-soft { 0% { transform: scale(0.98); } 100% { transform: scale(1); } }
+
+/* Segmentado con indicador que se desliza. */
+.segmented { position: relative; }
+.segmented::before {
+  content: ""; position: absolute; top: 4px; bottom: 4px; left: 4px; width: calc(50% - 6px);
+  background: var(--surface-2); border-radius: 10px; transition: transform 0.4s var(--spring);
+}
+.segmented[data-pos="1"]::before { transform: translateX(calc(100% + 4px)); }
+.segmented button { position: relative; z-index: 1; }
+.segmented button.on { background: transparent; }
+
+/* Transiciones entre pantallas. */
+.page { animation: page-in 0.42s var(--ease-out) both; }
+.page.back { animation-name: page-back; }
+@keyframes page-in { from { opacity: 0; transform: translateX(28px); } to { opacity: 1; transform: none; } }
+@keyframes page-back { from { opacity: 0; transform: translateX(-28px); } to { opacity: 1; transform: none; } }
+
+/* Entrada escalonada de listas y bloques. */
+.row-item.enter { animation: rise 0.45s var(--ease-out) both; animation-delay: calc(var(--i, 0) * 45ms); }
+.hero, .actions, .summary, .versus, .bet-head { animation: rise 0.5s var(--ease-out) both; }
+.actions { animation-delay: 60ms; }
+.versus { animation-delay: 80ms; }
+.summary { animation-delay: 120ms; }
+.reveal { animation: rise 0.3s var(--ease-out) both; }
+@keyframes rise { from { opacity: 0; transform: translateY(12px); } to { opacity: 1; transform: none; } }
+
+/* Rebote del importe al cambiarlo. */
+.bump { animation: bump 0.35s var(--spring); }
+strong.bump { display: inline-block; }
+@keyframes bump { 0% { transform: scale(1); } 40% { transform: scale(1.08); } 100% { transform: scale(1); } }
+
+/* Spinner en el botón que espera a la wallet. */
+.btn.last[data-busy]::before {
+  content: ""; display: inline-block; width: 15px; height: 15px; margin-right: 10px; vertical-align: -2px;
+  border-radius: 50%; border: 2px solid currentColor; border-right-color: transparent;
+  animation: spin 0.7s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* Carga con brillo. */
+.shimmer {
+  background: linear-gradient(90deg, var(--surface-2) 0%, #3a3a3e 50%, var(--surface-2) 100%);
+  background-size: 200% 100%; animation: shimmer 1.2s ease-in-out infinite;
+}
+.line.shimmer { height: 12px; border-radius: 6px; }
+.skeleton { pointer-events: none; }
+@keyframes shimmer { from { background-position: 100% 0; } to { background-position: -100% 0; } }
+
+/* Mensajes. */
+.toast { animation: rise 0.3s var(--ease-out) both; }
+.toast.err { animation: rise 0.3s var(--ease-out) both, shake 0.4s 0.1s; }
+@keyframes shake { 20%, 60% { transform: translateX(-5px); } 40%, 80% { transform: translateX(5px); } }
+
+/* Pantalla de éxito. */
+.success-overlay {
+  position: fixed; inset: 0; z-index: 100; display: grid; place-items: center;
+  background: rgba(10, 10, 12, 0.72); backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px);
+  animation: fade 0.2s ease both, fade 0.3s ease 1.4s reverse forwards;
+}
+.success-card { display: flex; flex-direction: column; align-items: center; gap: 16px; animation: pop 0.45s var(--spring) both; }
+.check { width: 92px; height: 92px; }
+.check circle {
+  fill: rgba(62, 224, 154, 0.12); stroke: var(--ok); stroke-width: 3;
+  stroke-dasharray: 151; stroke-dashoffset: 151; animation: draw 0.5s var(--ease-out) 0.05s forwards;
+}
+.check path {
+  fill: none; stroke: var(--ok); stroke-width: 4; stroke-linecap: round; stroke-linejoin: round;
+  stroke-dasharray: 40; stroke-dashoffset: 40; animation: draw 0.35s var(--ease-out) 0.45s forwards;
+}
+.success-text { font-size: 1.3rem; font-weight: 700; animation: rise 0.4s var(--ease-out) 0.35s both; }
+@keyframes draw { to { stroke-dashoffset: 0; } }
+@keyframes fade { from { opacity: 0; } to { opacity: 1; } }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; transition-duration: 0.01ms !important; }
+}

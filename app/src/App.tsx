@@ -1,8 +1,9 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useConnection, useWallet } from "@solana/wallet-adapter-react";
 import { BaseWalletMultiButton } from "@solana/wallet-adapter-react-ui";
 import { LAMPORTS_PER_SOL, PublicKey, Transaction, TransactionInstruction } from "@solana/web3.js";
 import { getMint } from "@solana/spl-token";
+import type React from "react";
 import { DEFAULT_MINT, PROGRAM_ID } from "./config";
 import {
   Bet,
@@ -107,6 +108,94 @@ function useHashRoute() {
 
 type Msg = { ok: boolean; text: string; sig?: string } | null;
 
+// ---------- animaciones ----------
+
+const SUCCESS_EVENT = "wager:success";
+const celebrate = (text: string) => window.dispatchEvent(new CustomEvent(SUCCESS_EVENT, { detail: text }));
+
+/** Pantalla de éxito con un check que se dibuja, como al enviar en una wallet. */
+function SuccessOverlay() {
+  const [text, setText] = useState<string | null>(null);
+  const [n, setN] = useState(0);
+  useEffect(() => {
+    const on = (e: Event) => {
+      setText((e as CustomEvent<string>).detail);
+      setN((x) => x + 1);
+    };
+    window.addEventListener(SUCCESS_EVENT, on);
+    return () => window.removeEventListener(SUCCESS_EVENT, on);
+  }, []);
+  useEffect(() => {
+    if (!text) return;
+    navigator.vibrate?.([12, 60, 18]);
+    const t = setTimeout(() => setText(null), 1700);
+    return () => clearTimeout(t);
+  }, [text, n]);
+  if (!text) return null;
+  return (
+    <div className="success-overlay" key={n} onClick={() => setText(null)}>
+      <div className="success-card">
+        <svg className="check" viewBox="0 0 52 52">
+          <circle cx="26" cy="26" r="24" />
+          <path d="M15 27l7 7 15-16" />
+        </svg>
+        <div className="success-text">{text}</div>
+      </div>
+    </div>
+  );
+}
+
+/** Vibración corta al tocar botones (Android) y marca del último botón pulsado. */
+function useTapFeedback() {
+  useEffect(() => {
+    const on = (e: PointerEvent) => {
+      const el = (e.target as HTMLElement).closest("button, .action, .row-item, a.btn");
+      if (!el) return;
+      navigator.vibrate?.(8);
+      if (el.classList.contains("btn")) {
+        document.querySelectorAll(".btn.last").forEach((b) => b.classList.remove("last"));
+        el.classList.add("last");
+      }
+    };
+    document.addEventListener("pointerdown", on);
+    return () => document.removeEventListener("pointerdown", on);
+  }, []);
+}
+
+/** Reproduce una animación de "rebote" cada vez que cambia `value`. */
+function useBump<T extends HTMLElement>(value: unknown) {
+  const ref = useRef<T>(null);
+  const first = useRef(true);
+  useEffect(() => {
+    if (first.current) {
+      first.current = false;
+      return;
+    }
+    const el = ref.current;
+    if (!el) return;
+    el.classList.remove("bump");
+    void el.offsetWidth; // reinicia la animación
+    el.classList.add("bump");
+  }, [value]);
+  return ref;
+}
+
+function Skeleton({ rows = 2 }: { rows?: number }) {
+  return (
+    <>
+      {Array.from({ length: rows }, (_, i) => (
+        <div key={i} className="row-item skeleton">
+          <div className="avatar shimmer" />
+          <div className="main">
+            <div className="line shimmer" style={{ width: "70%" }} />
+            <div className="line shimmer" style={{ width: "35%", marginTop: 8 }} />
+          </div>
+        </div>
+      ))}
+    </>
+  );
+}
+
 /** Firma con la wallet, envía y espera confirmación. */
 function useSend() {
   const { connection } = useConnection();
@@ -129,6 +218,7 @@ function useSend() {
           throw { logs: t?.meta?.logMessages ?? [], message: JSON.stringify(res.value.err) };
         }
         setMsg({ ok: true, text: okText, sig });
+        celebrate(okText);
         return true;
       } catch (e) {
         console.error(e);
@@ -207,6 +297,13 @@ export function App() {
   const { wallets } = useWallet();
   const route = hash.startsWith("#/bet/") ? "bet" : hash === "#/new" ? "new" : "home";
   const here = window.location.href;
+  useTapFeedback();
+
+  // Hacia dentro desliza desde la derecha; al volver al inicio, desde la izquierda.
+  // La dirección se fija una vez por navegación para no reiniciar la animación.
+  const nav = useRef({ hash, dir: "forward" });
+  if (nav.current.hash !== hash) nav.current = { hash, dir: route === "home" ? "back" : "forward" };
+  const dir = nav.current.dir;
 
   return (
     <div className="shell">
@@ -235,7 +332,10 @@ export function App() {
         </div>
       )}
 
-      {route === "bet" ? <BetView address={hash.slice(6)} /> : route === "new" ? <CreateBet /> : <Home />}
+      <div className={`page ${dir}`} key={hash}>
+        {route === "bet" ? <BetView address={hash.slice(6)} /> : route === "new" ? <CreateBet /> : <Home />}
+      </div>
+      <SuccessOverlay />
 
       <p className="muted center" style={{ fontSize: "0.75rem", marginTop: 28 }}>
         Red de pruebas: el dinero no es real ·{" "}
@@ -307,9 +407,9 @@ function statusInfo(b: Bet): { text: string; cls: string } {
   return { text: "Lista para cobrar", cls: "done" };
 }
 
-function BetRow({ b, decimals }: { b: Bet; decimals: number }) {
+function BetRow({ b, decimals, i }: { b: Bet; decimals: number; i: number }) {
   return (
-    <a className="row-item" href={`#/bet/${b.address.toBase58()}`}>
+    <a className="row-item enter" style={{ "--i": i } as React.CSSProperties} href={`#/bet/${b.address.toBase58()}`}>
       <Avatar seed={b.address.toBase58()} label={initial(b.description)} />
       <div className="main">
         <div className="t">{b.description}</div>
@@ -347,7 +447,7 @@ function BetList() {
       b.acceptDeadline > now(),
   );
   // Todas las apuestas de la web usan USDC de devnet (6 decimales).
-  const row = (b: Bet) => <BetRow key={b.address.toBase58()} b={b} decimals={6} />;
+  const row = (b: Bet, i: number) => <BetRow key={b.address.toBase58()} b={b} decimals={6} i={i} />;
 
   return (
     <>
@@ -355,7 +455,7 @@ function BetList() {
         <>
           <div className="section-title">Mis apuestas <span>{bets ? mine.length : ""}</span></div>
           <div className="list">
-            {bets === null ? <div className="empty">Cargando…</div>
+            {bets === null ? <Skeleton />
               : mine.length ? mine.map(row)
               : <div className="empty">Aún no tienes apuestas. ¡Crea la primera!</div>}
           </div>
@@ -363,7 +463,7 @@ function BetList() {
       )}
       <div className="section-title">Abiertas para ti <span>{bets ? open.length : ""}</span></div>
       <div className="list">
-        {bets === null ? <div className="empty">Cargando…</div>
+        {bets === null ? <Skeleton />
           : open.length ? open.map(row)
           : <div className="empty">No hay apuestas abiertas ahora mismo.</div>}
       </div>
@@ -422,6 +522,9 @@ function CreateBet() {
   else if (mode === "friend" && (opp === null || opp === "invalid")) blocker = "Dirección del amigo no válida";
   else if (arb === "invalid") blocker = "Dirección del árbitro no válida";
 
+  const amountRef = useBump<HTMLDivElement>(amount);
+  const winRef = useBump<HTMLElement>(amount);
+
   async function paste(set: (v: string) => void) {
     try {
       set((await navigator.clipboard.readText()).trim());
@@ -451,7 +554,7 @@ function CreateBet() {
   return (
     <>
       <div className="amount-box">
-        <div className="amount-input">
+        <div className="amount-input" ref={amountRef}>
           <input
             inputMode="decimal"
             aria-label="Importe"
@@ -478,7 +581,7 @@ function CreateBet() {
         <div className="summary">
           <div className="line"><span>Tú pones</span><strong>{fmt(stake)} USDC</strong></div>
           <div className="line"><span>Tu rival pone</span><strong>{fmt(stake)} USDC</strong></div>
-          <div className="line"><span>Si ganas te llevas</span><strong className="win">{fmt(stake * 2n)} USDC</strong></div>
+          <div className="line"><span>Si ganas te llevas</span><strong className="win" ref={winRef}>{fmt(stake * 2n)} USDC</strong></div>
         </div>
       )}
 
@@ -491,12 +594,12 @@ function CreateBet() {
 
       <div className="field">
         <label>¿Contra quién?</label>
-        <div className="segmented">
+        <div className="segmented" data-pos={mode === "friend" ? 1 : 0}>
           <button className={mode === "anyone" ? "on" : ""} onClick={() => setMode("anyone")}>Quien tenga el enlace</button>
           <button className={mode === "friend" ? "on" : ""} onClick={() => setMode("friend")}>Un amigo concreto</button>
         </div>
         {mode === "friend" && (
-          <div className="input-wrap" style={{ marginTop: 8 }}>
+          <div className="input-wrap reveal" style={{ marginTop: 8 }}>
             <input className="input" value={opponent} placeholder="Dirección de Solana de tu amigo"
               onChange={(e) => setOpponent(e.target.value)} />
             <button className="paste" onClick={() => paste(setOpponent)}>Pegar</button>
@@ -541,8 +644,8 @@ function CreateBet() {
 
       <div className="cta-bar">
         <div className="inner">
-          <button className="btn" disabled={!!blocker || busy} onClick={submit}>
-            {busy ? "Confirma en tu wallet…" : blocker || `Apostar ${fmt(stake!)} USDC`}
+          <button data-busy={busy || undefined} className="btn" disabled={!!blocker || busy} onClick={submit}>
+            {busy ? "Confirma en tu wallet" : blocker || `Apostar ${fmt(stake!)} USDC`}
           </button>
           {blocker === "Saldo insuficiente" && (
             <p className="toast"><a target="_blank" rel="noreferrer" href="https://faucet.circle.com">Conseguir USDC de prueba</a></p>
@@ -595,7 +698,14 @@ function BetView({ address }: { address: string }) {
   const { token } = useBalances(bet?.mint.toBase58() ?? DEFAULT_MINT, msg);
 
   if (loadError) return <div className="notice"><span className="dot" /><div>No se pudo conectar con devnet: {loadError}</div></div>;
-  if (bet === undefined) return <div className="empty" style={{ marginTop: 20 }}>Cargando…</div>;
+  if (bet === undefined)
+    return (
+      <div className="bet-head">
+        <div className="line shimmer" style={{ width: 110, height: 22, margin: "0 auto", borderRadius: 99 }} />
+        <div className="line shimmer" style={{ width: "80%", height: 26, margin: "16px auto 0" }} />
+        <div className="line shimmer" style={{ width: 140, height: 48, margin: "16px auto 0" }} />
+      </div>
+    );
   if (bet === null)
     return (
       <div className="bet-head">
@@ -699,21 +809,21 @@ function BetView({ address }: { address: string }) {
       </div>
 
       {bet.status === BetStatus.Open && (isCreator || !publicKey) && (
-        <button className="btn" onClick={share}>{copied ? "¡Enlace copiado!" : "Compartir con tu amigo"}</button>
+        <button data-busy={busy || undefined} className="btn" onClick={share}>{copied ? "¡Enlace copiado!" : "Compartir con tu amigo"}</button>
       )}
 
       {canAccept && (
         <>
-          <button className="btn" disabled={busy || lowBalance}
+          <button data-busy={busy || undefined} className="btn" disabled={busy || lowBalance}
             onClick={() => act([acceptBetIx(bet, publicKey!)], "¡Apuesta aceptada!")}>
-            {busy ? "Confirma en tu wallet…" : lowBalance ? "Saldo insuficiente" : `Aceptar y apostar ${fmt(bet.stake)} USDC`}
+            {busy ? "Confirma en tu wallet" : lowBalance ? "Saldo insuficiente" : `Aceptar y apostar ${fmt(bet.stake)} USDC`}
           </button>
           <p className="hint center">Apuestas a que <strong>no</strong> ocurre. Si aciertas te llevas {fmt(bet.stake * 2n)} USDC.</p>
         </>
       )}
 
       {isCreator && bet.status === BetStatus.Open && (
-        <button className="btn danger" disabled={busy}
+        <button data-busy={busy || undefined} className="btn danger" disabled={busy}
           onClick={() => act([cancelBetIx(bet)], "Apuesta cancelada. Te hemos devuelto el dinero.")}>
           Cancelar y recuperar {fmt(bet.stake)} USDC
         </button>
@@ -735,7 +845,7 @@ function BetView({ address }: { address: string }) {
             ))}
           </div>
           <div className="spacer" />
-          <button className="btn" disabled={busy || choice === null || (canVote && choice === myVote)}
+          <button data-busy={busy || undefined} className="btn" disabled={busy || choice === null || (canVote && choice === myVote)}
             onClick={() =>
               choice !== null &&
               act(
@@ -743,20 +853,20 @@ function BetView({ address }: { address: string }) {
                 canArbitrate ? "Resultado decidido" : "Voto registrado",
               )
             }>
-            {busy ? "Confirma en tu wallet…" : canArbitrate ? "Confirmar decisión" : "Confirmar voto"}
+            {busy ? "Confirma en tu wallet" : canArbitrate ? "Confirmar decisión" : "Confirmar voto"}
           </button>
         </>
       )}
 
       {publicKey && bet.status === BetStatus.Resolved && (
-        <button className="btn" disabled={busy}
+        <button data-busy={busy || undefined} className="btn" disabled={busy}
           onClick={async () => setSettled(await act(settleIxs(bet, publicKey, false), "¡Pagado!"))}>
-          {busy ? "Confirma en tu wallet…" : iWon ? `Cobrar ${fmt(bet.stake * 2n)} USDC` : "Liquidar apuesta"}
+          {busy ? "Confirma en tu wallet" : iWon ? `Cobrar ${fmt(bet.stake * 2n)} USDC` : "Liquidar apuesta"}
         </button>
       )}
 
       {publicKey && bet.status === BetStatus.Matched && t > bet.resolveDeadline && (
-        <button className="btn" disabled={busy}
+        <button data-busy={busy || undefined} className="btn" disabled={busy}
           onClick={async () => setSettled(await act(settleIxs(bet, publicKey, true), "Dinero devuelto a los dos"))}>
           Recuperar mi dinero
         </button>

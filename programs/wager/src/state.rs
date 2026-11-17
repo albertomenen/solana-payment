@@ -3,6 +3,45 @@ use anchor_lang::prelude::*;
 pub const BET_SEED: &[u8] = b"bet";
 pub const VAULT_SEED: &[u8] = b"vault";
 pub const MAX_DESCRIPTION_LEN: usize = 200;
+/// Margen máximo entre `resolve_at` y el precio de Pyth que se use.
+pub const MAX_PRICE_DELAY: i64 = 60;
+/// Tiempo mínimo entre `resolve_at` y `resolve_deadline` para poder resolver.
+pub const MIN_RESOLVE_WINDOW: i64 = 3600;
+
+/// Condición de precio resuelta por el oráculo de Pyth: "el precio de
+/// `feed_id` en `resolve_at` está por encima (o por debajo) de `threshold`".
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, PartialEq, Eq, Debug, InitSpace)]
+pub struct PriceCondition {
+    /// Feed de Pyth (p. ej. SOL/USD).
+    pub feed_id: [u8; 32],
+    /// Umbral: `threshold * 10^expo` (p. ej. 300 $ = 30_000_000_000 con expo -8).
+    pub threshold: i64,
+    pub expo: i32,
+    /// `true`: gana el creador si el precio es mayor que el umbral.
+    /// `false`: gana el creador si el precio es menor que el umbral.
+    pub above: bool,
+    /// Momento (unix) en que se mira el precio.
+    pub resolve_at: i64,
+}
+
+impl PriceCondition {
+    /// Resultado para un precio `price * 10^exponent`. `None` si no se puede comparar.
+    pub fn outcome(&self, price: i64, exponent: i32) -> Option<Outcome> {
+        let min = exponent.min(self.expo);
+        let scale = |v: i64, e: i32| -> Option<i128> {
+            10i128
+                .checked_pow(u32::try_from(e - min).ok()?)?
+                .checked_mul(v as i128)
+        };
+        let (p, t) = (scale(price, exponent)?, scale(self.threshold, self.expo)?);
+        let creator_wins = if self.above { p > t } else { p < t };
+        Some(if creator_wins {
+            Outcome::CreatorWins
+        } else {
+            Outcome::AcceptorWins
+        })
+    }
+}
 
 /// Resultado de una apuesta.
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, PartialEq, Eq, Debug, InitSpace)]
@@ -50,6 +89,8 @@ pub struct Bet {
     pub status: BetStatus,
     pub bump: u8,
     pub vault_bump: u8,
+    /// Si es `Some`, la apuesta la resuelve el oráculo de Pyth (no hay votos).
+    pub condition: Option<PriceCondition>,
     #[max_len(MAX_DESCRIPTION_LEN)]
     pub description: String,
 }
@@ -109,6 +150,7 @@ mod tests {
             status: BetStatus::Matched,
             bump: 0,
             vault_bump: 0,
+            condition: None,
             description: String::new(),
         }
     }
@@ -142,6 +184,35 @@ mod tests {
         // El creador reconoce que perdió.
         assert!(bet.record_vote(&c, Outcome::AcceptorWins).unwrap());
         assert_eq!(bet.outcome, Some(Outcome::AcceptorWins));
+    }
+
+    #[test]
+    fn price_condition_compares_across_exponents() {
+        // Umbral 300 $ con expo -8; precio 300,5 $ con expo -6.
+        let cond = PriceCondition {
+            feed_id: [0; 32],
+            threshold: 30_000_000_000,
+            expo: -8,
+            above: true,
+            resolve_at: 0,
+        };
+        assert_eq!(cond.outcome(300_500_000, -6), Some(Outcome::CreatorWins));
+        assert_eq!(cond.outcome(299_900_000, -6), Some(Outcome::AcceptorWins));
+        // Igual al umbral: no es "mayor que", gana el rival.
+        assert_eq!(
+            cond.outcome(30_000_000_000, -8),
+            Some(Outcome::AcceptorWins)
+        );
+        let below = PriceCondition {
+            above: false,
+            ..cond
+        };
+        assert_eq!(
+            below.outcome(29_999_999_999, -8),
+            Some(Outcome::CreatorWins)
+        );
+        // Exponentes absurdos no desbordan.
+        assert_eq!(cond.outcome(1, 40), None);
     }
 
     #[test]

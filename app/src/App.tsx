@@ -5,6 +5,7 @@ import { LAMPORTS_PER_SOL, PublicKey, Transaction, TransactionInstruction } from
 import { getMint } from "@solana/spl-token";
 import type React from "react";
 import { DEFAULT_MINT, PROGRAM_ID } from "./config";
+import { FEEDS, THRESHOLD_EXPO, feedSymbol, fromHex, latestPrice, resolveWithPyth, scaled, toHex } from "./pyth";
 import {
   Bet,
   BetStatus,
@@ -203,12 +204,28 @@ function useSend() {
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState<Msg>(null);
 
+  /** Ejecuta `fn` mostrando el estado (cargando, éxito o error). */
+  const run = useCallback(async (fn: () => Promise<string | undefined>, okText: string) => {
+    setBusy(true);
+    setMsg(null);
+    try {
+      const sig = await fn();
+      setMsg({ ok: true, text: okText, sig });
+      celebrate(okText);
+      return true;
+    } catch (e) {
+      console.error(e);
+      setMsg({ ok: false, text: explainError(e) });
+      return false;
+    } finally {
+      setBusy(false);
+    }
+  }, []);
+
   const send = useCallback(
     async (ixs: TransactionInstruction[], okText: string) => {
       if (!publicKey) return false;
-      setBusy(true);
-      setMsg(null);
-      try {
+      return run(async () => {
         const latest = await connection.getLatestBlockhash();
         const tx = new Transaction({ feePayer: publicKey, ...latest }).add(...ixs);
         const sig = await sendTransaction(tx, connection);
@@ -217,20 +234,12 @@ function useSend() {
           const t = await connection.getTransaction(sig, { maxSupportedTransactionVersion: 0 });
           throw { logs: t?.meta?.logMessages ?? [], message: JSON.stringify(res.value.err) };
         }
-        setMsg({ ok: true, text: okText, sig });
-        celebrate(okText);
-        return true;
-      } catch (e) {
-        console.error(e);
-        setMsg({ ok: false, text: explainError(e) });
-        return false;
-      } finally {
-        setBusy(false);
-      }
+        return sig;
+      }, okText);
     },
-    [connection, publicKey, sendTransaction],
+    [connection, publicKey, sendTransaction, run],
   );
-  return { send, busy, msg };
+  return { send, run, busy, msg };
 }
 
 function Toast({ msg }: { msg: Msg }) {
@@ -279,6 +288,27 @@ function useBalances(mintStr: string, refresh: unknown) {
 
   return { sol, token, decimals };
 }
+
+/** Precio en vivo de un feed de Pyth (se refresca cada 10 s). */
+function useLivePrice(feedHex: string | null) {
+  const [price, setPrice] = useState<number | null>(null);
+  useEffect(() => {
+    setPrice(null);
+    if (!feedHex) return;
+    let alive = true;
+    const load = () => latestPrice(feedHex).then((p) => alive && setPrice(p)).catch(() => {});
+    load();
+    const id = setInterval(load, 10_000);
+    return () => {
+      alive = false;
+      clearInterval(id);
+    };
+  }, [feedHex]);
+  return price;
+}
+
+const fmtUsd = (v: number) =>
+  v.toLocaleString("es-ES", { maximumFractionDigits: v >= 1000 ? 0 : 2, minimumFractionDigits: v >= 1000 ? 0 : 2 }) + " $";
 
 // ================= app =================
 
@@ -402,8 +432,11 @@ function statusInfo(b: Bet): { text: string; cls: string } {
   const t = now();
   if (b.status === BetStatus.Open)
     return b.acceptDeadline > t ? { text: "Esperando rival", cls: "warn" } : { text: "Caducada", cls: "" };
-  if (b.status === BetStatus.Matched)
-    return b.resolveDeadline > t ? { text: "En juego", cls: "live" } : { text: "Plazo vencido", cls: "warn" };
+  if (b.status === BetStatus.Matched) {
+    if (b.resolveDeadline <= t) return { text: "Plazo vencido", cls: "warn" };
+    if (b.condition && b.condition.resolveAt <= t) return { text: "Lista para resolver", cls: "warn" };
+    return { text: "En juego", cls: "live" };
+  }
   return { text: "Lista para cobrar", cls: "done" };
 }
 
@@ -487,6 +520,14 @@ const RESOLVE_OPTS = [
   { label: "6 meses", s: 15552000 },
 ];
 const QUICK_AMOUNTS = ["1", "5", "10", "25"];
+const PRICE_AT_OPTS = [
+  { label: "10 min", s: 600 },
+  { label: "1 hora", s: 3600 },
+  { label: "1 día", s: 86400 },
+  { label: "1 semana", s: 604800 },
+  { label: "1 mes", s: 2592000 },
+];
+const WEEK = 604800;
 
 function CreateBet() {
   const { publicKey } = useWallet();
@@ -500,6 +541,25 @@ function CreateBet() {
   const [resolveS, setResolveS] = useState(2592000);
   const [mintStr, setMintStr] = useState(DEFAULT_MINT);
   const { token, decimals } = useBalances(mintStr, msg);
+  // Apuesta de precio (oráculo de Pyth).
+  const [kind, setKind] = useState<"vote" | "price">("vote");
+  const [feed, setFeed] = useState<(typeof FEEDS)[number]>(FEEDS[0]);
+  const [above, setAbove] = useState(true);
+  const [thresholdStr, setThresholdStr] = useState("");
+  const [priceAtS, setPriceAtS] = useState(86400);
+  const livePrice = useLivePrice(kind === "price" ? feed.id : null);
+  const isPrice = kind === "price";
+  const threshold = Number(thresholdStr.replace(",", "."));
+
+  // Al cambiar de activo, proponer el precio actual como umbral.
+  useEffect(() => setThresholdStr(""), [feed]);
+  useEffect(() => {
+    if (livePrice !== null && !thresholdStr) setThresholdStr(String(Math.round(livePrice)));
+  }, [livePrice, thresholdStr]);
+  // En apuestas de precio, aceptar siempre antes de que se mire el precio.
+  useEffect(() => {
+    if (isPrice && acceptS > priceAtS) setAcceptS([...ACCEPT_OPTS].reverse().find((o) => o.s <= priceAtS)!.s);
+  }, [isPrice, acceptS, priceAtS]);
 
   const dec = decimals ?? 6;
   const stake = parseAmount(amount || "0", dec);
@@ -518,9 +578,13 @@ function CreateBet() {
   else if (!stake || stake <= 0n) blocker = "Introduce un importe";
   else if (decimals === null) blocker = "Token no válido";
   else if (token !== null && stake > token) blocker = "Saldo insuficiente";
-  else if (!description.trim()) blocker = "Escribe qué apostáis";
+  else if (isPrice && !(threshold > 0)) blocker = "Indica el precio";
+  else if (!isPrice && !description.trim()) blocker = "Escribe qué apostáis";
   else if (mode === "friend" && (opp === null || opp === "invalid")) blocker = "Dirección del amigo no válida";
-  else if (arb === "invalid") blocker = "Dirección del árbitro no válida";
+  else if (!isPrice && arb === "invalid") blocker = "Dirección del árbitro no válida";
+
+  const priceSentence = (t: number) =>
+    `${feed.symbol} ${above ? "por encima de" : "por debajo de"} ${fmtUsd(threshold || 0)} el ${fmtDate(t + priceAtS)}`;
 
   const amountRef = useBump<HTMLDivElement>(amount);
   const winRef = useBump<HTMLElement>(amount);
@@ -541,12 +605,21 @@ function CreateBet() {
       creator: publicKey,
       mint: new PublicKey(mintStr),
       betId,
-      description: description.trim(),
+      description: isPrice ? priceSentence(t) : description.trim(),
       stake,
       opponent: opp instanceof PublicKey ? opp : null,
-      arbiter: arb instanceof PublicKey ? arb : null,
+      arbiter: !isPrice && arb instanceof PublicKey ? arb : null,
       acceptDeadline: t + acceptS,
-      resolveDeadline: t + resolveS,
+      resolveDeadline: isPrice ? t + priceAtS + WEEK : t + resolveS,
+      condition: isPrice
+        ? {
+            feedId: fromHex(feed.id),
+            threshold: BigInt(Math.round(threshold * 10 ** -THRESHOLD_EXPO)),
+            expo: THRESHOLD_EXPO,
+            above,
+            resolveAt: t + priceAtS,
+          }
+        : null,
     });
     if (await send([ix], "¡Apuesta creada!")) window.location.hash = `#/bet/${bet.toBase58()}`;
   }
@@ -586,11 +659,60 @@ function CreateBet() {
       )}
 
       <div className="field">
-        <label>¿Qué apostáis?</label>
-        <input className="input" value={description} maxLength={200}
-          placeholder="El Real Madrid gana la Champions" onChange={(e) => setDescription(e.target.value)} />
-        <p className="hint">Tú apuestas a que ocurre; tu rival, a que no.</p>
+        <label>¿Cómo se decide?</label>
+        <div className="segmented" data-pos={isPrice ? 1 : 0}>
+          <button className={!isPrice ? "on" : ""} onClick={() => setKind("vote")}>Lo votáis vosotros</button>
+          <button className={isPrice ? "on" : ""} onClick={() => setKind("price")}>Precio cripto · Pyth</button>
+        </div>
       </div>
+
+      {!isPrice ? (
+        <div className="field reveal" key="vote">
+          <label>¿Qué apostáis?</label>
+          <input className="input" value={description} maxLength={200}
+            placeholder="El Real Madrid gana la Champions" onChange={(e) => setDescription(e.target.value)} />
+          <p className="hint">Tú apuestas a que ocurre; tu rival, a que no.</p>
+        </div>
+      ) : (
+        <div className="reveal" key="price">
+          <div className="field">
+            <label>Activo</label>
+            <div className="chips left">
+              {FEEDS.map((f) => (
+                <button key={f.id} className={`chip ${feed.id === f.id ? "on" : ""}`} onClick={() => setFeed(f)}>{f.symbol}</button>
+              ))}
+            </div>
+            <p className="hint">{livePrice === null ? "Consultando precio en Pyth…" : `Ahora: ${fmtUsd(livePrice)}`}</p>
+          </div>
+          <div className="field">
+            <label>Tú apuestas a que {feed.symbol} estará…</label>
+            <div className="segmented" data-pos={above ? 0 : 1}>
+              <button className={above ? "on" : ""} onClick={() => setAbove(true)}>Por encima de</button>
+              <button className={!above ? "on" : ""} onClick={() => setAbove(false)}>Por debajo de</button>
+            </div>
+            <div className="input-wrap" style={{ marginTop: 8 }}>
+              <input className="input" inputMode="decimal" value={thresholdStr}
+                onChange={(e) => setThresholdStr(e.target.value.replace(/[^\d.,]/g, ""))} />
+              <span className="paste" style={{ pointerEvents: "none" }}>USD</span>
+            </div>
+          </div>
+          <div className="field">
+            <label>Se mira el precio dentro de</label>
+            <div className="chips left">
+              {PRICE_AT_OPTS.map((o) => (
+                <button key={o.s} className={`chip ${priceAtS === o.s ? "on" : ""}`} onClick={() => setPriceAtS(o.s)}>{o.label}</button>
+              ))}
+            </div>
+          </div>
+          <div className="notice accent">
+            <span className="dot" />
+            <div>
+              Ganas tú si <strong>{priceSentence(now())}</strong>. Si no, gana tu rival.
+              Lo decide el precio oficial de Pyth: nadie tiene que votar.
+            </div>
+          </div>
+        </div>
+      )}
 
       <div className="field">
         <label>¿Contra quién?</label>
@@ -610,13 +732,13 @@ function CreateBet() {
       <div className="field">
         <label>Tiempo para aceptar</label>
         <div className="chips left">
-          {ACCEPT_OPTS.map((o) => (
+          {ACCEPT_OPTS.filter((o) => !isPrice || o.s <= priceAtS).map((o) => (
             <button key={o.s} className={`chip ${acceptS === o.s ? "on" : ""}`} onClick={() => setAcceptS(o.s)}>{o.label}</button>
           ))}
         </div>
       </div>
 
-      <div className="field">
+      {!isPrice && <div className="field">
         <label>Se decide antes de</label>
         <div className="chips left">
           {RESOLVE_OPTS.filter((o) => o.s > acceptS).map((o) => (
@@ -624,18 +746,18 @@ function CreateBet() {
           ))}
         </div>
         <p className="hint">Si para entonces no hay resultado, cada uno recupera su dinero.</p>
-      </div>
+      </div>}
 
       <details className="adv">
         <summary>Opciones avanzadas</summary>
-        <div className="field">
+        {!isPrice && <div className="field">
           <label>Árbitro (opcional)</label>
           <div className="input-wrap">
             <input className="input" value={arbiter} placeholder="Decide si no os ponéis de acuerdo"
               onChange={(e) => setArbiter(e.target.value)} />
             <button className="paste" onClick={() => paste(setArbiter)}>Pegar</button>
           </div>
-        </div>
+        </div>}
         <div className="field">
           <label>Token</label>
           <input className="input" value={mintStr} onChange={(e) => setMintStr(e.target.value.trim())} />
@@ -661,14 +783,15 @@ function CreateBet() {
 
 function BetView({ address }: { address: string }) {
   const { connection } = useConnection();
-  const { publicKey } = useWallet();
-  const { send, busy, msg } = useSend();
+  const { publicKey, signTransaction, signAllTransactions } = useWallet();
+  const { send, run, busy, msg } = useSend();
   const [bet, setBet] = useState<Bet | null | undefined>(undefined);
   const [loadError, setLoadError] = useState("");
   const [decimals, setDecimals] = useState(6);
   const [choice, setChoice] = useState<Outcome | null>(null);
   const [copied, setCopied] = useState(false);
   const [settled, setSettled] = useState(false);
+  const [resolvedPrice, setResolvedPrice] = useState<number | null>(null);
 
   const key = useMemo(() => {
     try {
@@ -696,6 +819,7 @@ function BetView({ address }: { address: string }) {
   }, [reload]);
 
   const { token } = useBalances(bet?.mint.toBase58() ?? DEFAULT_MINT, msg);
+  const livePrice = useLivePrice(bet?.condition ? toHex(bet.condition.feedId) : null);
 
   if (loadError) return <div className="notice"><span className="dot" /><div>No se pudo conectar con devnet: {loadError}</div></div>;
   if (bet === undefined)
@@ -727,9 +851,15 @@ function BetView({ address }: { address: string }) {
   const fmt = (v: bigint) => fmtAmount(v, decimals);
   const status = statusInfo(bet);
 
+  const cond = bet.condition;
+  const condSym = cond ? feedSymbol(cond.feedId) : "";
+  const condPrice = cond ? fmtUsd(scaled(cond.threshold, cond.expo)) : "";
+  const creatorSays = cond ? `${cond.above ? ">" : "<"} ${condPrice}` : "sí ocurre";
+  const acceptorSays = cond ? `${cond.above ? "≤" : "≥"} ${condPrice}` : "no ocurre";
+
   const outcomeLabel = (o: Outcome) =>
-    o === Outcome.CreatorWins ? `Gana ${who(bet.creator)} (sí ocurre)`
-      : o === Outcome.AcceptorWins ? `Gana ${matched ? who(bet.acceptor) : "el rival"} (no ocurre)`
+    o === Outcome.CreatorWins ? `Gana ${who(bet.creator)} (${creatorSays})`
+      : o === Outcome.AcceptorWins ? `Gana ${matched ? who(bet.acceptor) : "el rival"} (${acceptorSays})`
       : "Empate / anulada";
   const voteText = (o: Outcome | null) =>
     o === null ? "Sin votar" : o === Outcome.CreatorWins ? "Vota: sí" : o === Outcome.AcceptorWins ? "Vota: no" : "Vota: empate";
@@ -759,8 +889,20 @@ function BetView({ address }: { address: string }) {
   const canAccept =
     !!publicKey && bet.status === BetStatus.Open && !isCreator && !isArbiter && t < bet.acceptDeadline &&
     (!bet.opponent || bet.opponent.toBase58() === me);
-  const canVote = (isCreator || isAcceptor) && bet.status === BetStatus.Matched && t <= bet.resolveDeadline;
-  const canArbitrate = isArbiter && bet.status === BetStatus.Matched && t <= bet.resolveDeadline;
+  const canVote = !cond && (isCreator || isAcceptor) && bet.status === BetStatus.Matched && t <= bet.resolveDeadline;
+  const canArbitrate = !cond && isArbiter && bet.status === BetStatus.Matched && t <= bet.resolveDeadline;
+  const canResolvePyth =
+    !!cond && !!publicKey && !!signAllTransactions && bet.status === BetStatus.Matched &&
+    t >= cond.resolveAt && t <= bet.resolveDeadline;
+
+  const resolvePyth = async () => {
+    const done = await run(async () => {
+      const price = await resolveWithPyth(connection, { publicKey: publicKey!, signTransaction, signAllTransactions: signAllTransactions! }, bet);
+      setResolvedPrice(price);
+      return undefined;
+    }, "Resuelta con el precio de Pyth");
+    if (done) await reload();
+  };
   const myVote = isCreator ? bet.creatorVote : isAcceptor ? bet.acceptorVote : null;
   const lowBalance = token !== null && token < bet.stake;
   const iWon =
@@ -781,7 +923,7 @@ function BetView({ address }: { address: string }) {
         <div className={`side ${bet.outcome === Outcome.CreatorWins ? "win" : ""}`}>
           <Avatar seed={bet.creator.toBase58()} label={isCreator ? "Tú" : initial(bet.creator.toBase58())} />
           <strong>{who(bet.creator)}</strong>
-          <span className="vote">{matched ? voteText(bet.creatorVote) : "Dice que sí"}</span>
+          <span className="vote">{cond ? `Dice ${creatorSays}` : matched ? voteText(bet.creatorVote) : "Dice que sí"}</span>
         </div>
         <span className="vs">VS</span>
         <div className={`side ${bet.outcome === Outcome.AcceptorWins ? "win" : ""}`}>
@@ -789,13 +931,13 @@ function BetView({ address }: { address: string }) {
             <>
               <Avatar seed={bet.acceptor.toBase58()} label={isAcceptor ? "Tú" : initial(bet.acceptor.toBase58())} />
               <strong>{who(bet.acceptor)}</strong>
-              <span className="vote">{voteText(bet.acceptorVote)}</span>
+              <span className="vote">{cond ? `Dice ${acceptorSays}` : voteText(bet.acceptorVote)}</span>
             </>
           ) : (
             <>
               <div className="avatar" style={{ background: "var(--surface-2)" }}>?</div>
               <strong>{bet.opponent ? who(bet.opponent) : "Cualquiera"}</strong>
-              <span className="vote">Diría que no</span>
+              <span className="vote">{cond ? `Diría ${acceptorSays}` : "Diría que no"}</span>
             </>
           )}
         </div>
@@ -803,7 +945,16 @@ function BetView({ address }: { address: string }) {
 
       <div className="summary">
         {bet.status === BetStatus.Open && <div className="line"><span>Aceptar antes de</span><strong>{fmtDate(bet.acceptDeadline)}</strong></div>}
-        <div className="line"><span>Se decide antes de</span><strong>{fmtDate(bet.resolveDeadline)}</strong></div>
+        {cond ? (
+          <>
+            <div className="line"><span>Decide</span><strong>Oráculo Pyth · {condSym}/USD</strong></div>
+            <div className="line"><span>Se mira el precio</span><strong>{fmtDate(cond.resolveAt)}</strong></div>
+            <div className="line"><span>Precio ahora</span><strong>{livePrice === null ? "…" : fmtUsd(livePrice)}</strong></div>
+            {resolvedPrice !== null && <div className="line"><span>Precio en ese momento</span><strong>{fmtUsd(resolvedPrice)}</strong></div>}
+          </>
+        ) : (
+          <div className="line"><span>Se decide antes de</span><strong>{fmtDate(bet.resolveDeadline)}</strong></div>
+        )}
         {bet.arbiter && <div className="line"><span>Árbitro</span><strong>{who(bet.arbiter)}</strong></div>}
         {bet.outcome !== null && <div className="line"><span>Resultado</span><strong className="win">{outcomeLabel(bet.outcome)}</strong></div>}
       </div>
@@ -855,6 +1006,21 @@ function BetView({ address }: { address: string }) {
             }>
             {busy ? "Confirma en tu wallet" : canArbitrate ? "Confirmar decisión" : "Confirmar voto"}
           </button>
+        </>
+      )}
+
+      {cond && bet.status === BetStatus.Matched && t < cond.resolveAt && (
+        <p className="hint center">
+          El {fmtDate(cond.resolveAt)} se mirará el precio de {condSym} en Pyth. A partir de entonces cualquiera puede resolverla.
+        </p>
+      )}
+
+      {canResolvePyth && (
+        <>
+          <button data-busy={busy || undefined} className="btn" disabled={busy} onClick={resolvePyth}>
+            {busy ? "Confirma en tu wallet" : "Resolver con el precio de Pyth"}
+          </button>
+          <p className="hint center">Phantom te pedirá firmar varias transacciones: publican el precio firmado y resuelven la apuesta.</p>
         </>
       )}
 

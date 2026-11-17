@@ -21,12 +21,27 @@ create_bet ──► accept_bet ──► submit_result (ambos coinciden) ──
 | `cancel_bet`      | creador       | Mientras nadie la haya aceptado, recupera su dinero y cierra las cuentas |
 | `submit_result`   | participantes | Cada uno vota `CreatorWins`, `AcceptorWins` o `Draw`. Si ambos coinciden, queda resuelta. Se puede cambiar el voto |
 | `arbiter_resolve` | árbitro       | Decide el resultado si se configuró un árbitro (p. ej. ante un desacuerdo) |
+| `resolve_with_price` | cualquiera | Apuestas de precio: resuelve con el precio firmado de Pyth del momento acordado |
 | `settle`          | cualquiera    | Paga al ganador (o devuelve cada parte si es `Draw`) y cierra las cuentas |
 | `refund_expired`  | cualquiera    | Pasado `resolve_deadline` sin resultado, devuelve a cada uno lo suyo |
 
 `settle` y `refund_expired` no necesitan permisos: el dinero solo puede ir a cuentas de
 token cuyo dueño sea el creador o el aceptante, así que un bot puede liquidar
 automáticamente.
+
+### Apuestas de precio (oráculo de Pyth)
+
+Al crear la apuesta se puede añadir una `PriceCondition`: un feed de Pyth (p. ej.
+SOL/USD), un umbral, si el creador gana por encima o por debajo y el instante
+`resolve_at`. Estas apuestas no se votan ni tienen árbitro: a partir de `resolve_at`
+cualquiera publica el precio firmado de Pyth y llama a `resolve_with_price`.
+
+El programa solo acepta la actualización **canónica** de ese instante
+(`prev_publish_time < resolve_at <= publish_time`, con un margen máximo de 60 s),
+con verificación completa de Wormhole y del feed acordado, así que nadie puede elegir
+un precio que le convenga. Además, hay que aceptar antes de `resolve_at`, y
+`resolve_deadline` deja al menos una hora para resolver antes de que se active el
+reembolso.
 
 ### Cuentas
 - **`Bet`**: PDA `["bet", creator, bet_id (u64 LE)]` con los participantes, el importe,
@@ -88,7 +103,6 @@ terceros, redirigir el pago, aceptar una apuesta reservada a otra persona).
 > `anchor keys sync` para sustituirlo por el de tu keypair.
 
 ## Próximos pasos
-1. **Oráculo de precios (Pyth)** para apuestas como "BTC > 150k el 1 de enero".
-2. **Oráculo de eventos (Switchboard On-Demand)** para resultados deportivos.
-3. Auditoría antes de mainnet. Revisar también el marco legal (en España, la Ley 13/2011
+1. **Oráculo de eventos (Switchboard On-Demand)** para resultados deportivos.
+2. Auditoría antes de mainnet. Revisar también el marco legal (en España, la Ley 13/2011
    de regulación del juego).

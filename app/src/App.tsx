@@ -5,6 +5,7 @@ import { LAMPORTS_PER_SOL, PublicKey, Transaction, TransactionInstruction } from
 import { getMint } from "@solana/spl-token";
 import type React from "react";
 import { DEFAULT_MINT, PROGRAM_ID } from "./config";
+import { BattlePage } from "./battle/BattlePage";
 import { FEEDS, THRESHOLD_EXPO, feedSymbol, fromHex, latestPrice, resolveWithPyth, scaled, toHex } from "./pyth";
 import {
   Bet,
@@ -325,7 +326,7 @@ const WALLET_LABELS = {
 export function App() {
   const hash = useHashRoute();
   const { wallets } = useWallet();
-  const route = hash.startsWith("#/bet/") ? "bet" : hash === "#/new" ? "new" : "home";
+  const route = hash.startsWith("#/bet/") ? "bet" : hash === "#/new" ? "new" : hash.startsWith("#/battle") ? "battle" : "home";
   const here = window.location.href;
   useTapFeedback();
 
@@ -344,7 +345,7 @@ export function App() {
               <Icon d={ICONS.back} />
             </button>
           )}
-          <span className="title">{route === "new" ? "Nueva apuesta" : route === "bet" ? "Apuesta" : "Apuestas"}</span>
+          <span className="title">{route === "new" ? "Nueva apuesta" : route === "bet" ? "Apuesta" : route === "battle" ? "Batallas" : "Apuestas"}</span>
           {route === "home" && <span className="net-pill">Devnet</span>}
         </div>
         <BaseWalletMultiButton labels={WALLET_LABELS} />
@@ -363,7 +364,7 @@ export function App() {
       )}
 
       <div className={`page ${dir}`} key={hash}>
-        {route === "bet" ? <BetView address={hash.slice(6)} /> : route === "new" ? <CreateBet /> : <Home />}
+        {route === "bet" ? <BetView address={hash.slice(6)} /> : route === "new" ? <CreateBet /> : route === "battle" ? <BattlePage /> : <Home />}
       </div>
       <SuccessOverlay />
 
@@ -415,6 +416,15 @@ function Home() {
           <span className="ic"><Icon d={ICONS.bolt} /></span>SOL de prueba
         </a>
       </div>
+
+      <a className="promo" href="#/battle">
+        <span style={{ fontSize: "2rem" }}>⚔️</span>
+        <div style={{ flex: 1 }}>
+          <strong>Batallas de memecoins</strong>
+          <span className="muted" style={{ fontSize: "0.85rem" }}>Pon a pelear tus memecoins. Prototipo, sin dinero.</span>
+        </div>
+        <Icon d={ICONS.back.replace("M15 18l-6-6 6-6", "M9 18l6-6-6-6")} />
+      </a>
 
       {publicKey && sol === 0 && (
         <div className="notice">

@@ -1,59 +1,174 @@
-// Pixel art procedural: cada token genera siempre el mismo monstruo a partir
-// de su dirección (forma, ojos, colores) y su tipo (accesorios).
+// Pixel art de los luchadores. Dos estilos:
+// - "logo": el logo real de la memecoin pixelado, con los accesorios de su tipo.
+// - "monstruo": criatura procedural generada a partir de la dirección del token.
+// Si no se pueden leer los píxeles del logo (CORS), se usa el monstruo.
 import { MonType, hashSeed, rng } from "./engine";
-
-const N = 24; // rejilla 24×24
 
 type Grid = (string | null)[][];
 
 const hsl = (h: number, s: number, l: number) => `hsl(${Math.round(h)} ${s}% ${l}%)`;
+const emptyGrid = (n: number): Grid => Array.from({ length: n }, () => Array(n).fill(null));
 
-/** Color dominante (tono) del logo, si el servidor permite leer sus píxeles. */
-export async function logoHue(url?: string): Promise<number | null> {
-  if (!url) return null;
-  return new Promise((resolve) => {
+// ---------------- lectura del logo ----------------
+
+const LOGO_PX = 26; // tamaño del logo dentro del sprite de 32×32
+
+function loadImage(src: string): Promise<HTMLImageElement> {
+  return new Promise((resolve, reject) => {
     const img = new Image();
     img.crossOrigin = "anonymous";
-    img.onload = () => {
-      try {
-        const c = document.createElement("canvas");
-        c.width = c.height = 16;
-        const ctx = c.getContext("2d")!;
-        ctx.drawImage(img, 0, 0, 16, 16);
-        const d = ctx.getImageData(0, 0, 16, 16).data;
-        // Media circular de tonos, ponderada por saturación.
-        let x = 0, y = 0;
-        for (let i = 0; i < d.length; i += 4) {
-          const [r, g, b] = [d[i] / 255, d[i + 1] / 255, d[i + 2] / 255];
-          const max = Math.max(r, g, b), min = Math.min(r, g, b);
-          const sat = max - min;
-          if (sat < 0.15 || d[i + 3] < 128) continue;
-          let h = 0;
-          if (max === r) h = ((g - b) / sat) % 6;
-          else if (max === g) h = (b - r) / sat + 2;
-          else h = (r - g) / sat + 4;
-          const rad = (h * 60 * Math.PI) / 180;
-          x += Math.cos(rad) * sat;
-          y += Math.sin(rad) * sat;
-        }
-        resolve(x === 0 && y === 0 ? null : ((Math.atan2(y, x) * 180) / Math.PI + 360) % 360);
-      } catch {
-        resolve(null); // imagen sin CORS
-      }
-    };
-    img.onerror = () => resolve(null);
-    img.src = url;
+    img.onload = () => resolve(img);
+    img.onerror = reject;
+    img.src = src;
   });
 }
 
-export function spriteGrid(mint: string, type: MonType, hueOverride: number | null): Grid {
+function readPixels(img: HTMLImageElement): ImageData {
+  const c = document.createElement("canvas");
+  c.width = c.height = LOGO_PX;
+  const ctx = c.getContext("2d")!;
+  ctx.imageSmoothingQuality = "high";
+  ctx.drawImage(img, 0, 0, LOGO_PX, LOGO_PX);
+  return ctx.getImageData(0, 0, LOGO_PX, LOGO_PX); // lanza si la imagen no permite CORS
+}
+
+const pixelCache = new Map<string, Promise<ImageData | null>>();
+
+/**
+ * Píxeles del logo a 26×26. Primero directo; si el servidor no permite leerlo,
+ * a través de wsrv.nl (proxy de imágenes público con CORS que además la reduce).
+ */
+export function logoPixels(url?: string): Promise<ImageData | null> {
+  if (!url) return Promise.resolve(null);
+  if (!pixelCache.has(url)) {
+    const proxied = `https://wsrv.nl/?url=${encodeURIComponent(url)}&w=64&h=64&fit=cover&output=png`;
+    pixelCache.set(
+      url,
+      loadImage(url)
+        .then(readPixels)
+        .catch(() => loadImage(proxied).then(readPixels))
+        .catch(() => null),
+    );
+  }
+  return pixelCache.get(url)!;
+}
+
+/** Tono dominante (media circular ponderada por saturación). */
+export function dominantHue(d: ImageData): number | null {
+  let x = 0, y = 0;
+  for (let i = 0; i < d.data.length; i += 4) {
+    const [r, g, b] = [d.data[i] / 255, d.data[i + 1] / 255, d.data[i + 2] / 255];
+    const max = Math.max(r, g, b), min = Math.min(r, g, b);
+    const sat = max - min;
+    if (sat < 0.15 || d.data[i + 3] < 128) continue;
+    let h = max === r ? ((g - b) / sat) % 6 : max === g ? (b - r) / sat + 2 : (r - g) / sat + 4;
+    h = (h * 60 * Math.PI) / 180;
+    x += Math.cos(h) * sat;
+    y += Math.sin(h) * sat;
+  }
+  return x === 0 && y === 0 ? null : ((Math.atan2(y, x) * 180) / Math.PI + 360) % 360;
+}
+
+// ---------------- piezas comunes ----------------
+
+/** Accesorios del tipo encima de la cabeza (fila `top`), centrados en `cx`. */
+function addAccessory(g: Grid, type: MonType, cx: number, top: number) {
+  const put = (y: number, x: number, c: string) => {
+    if (y >= 0 && y < g.length && x >= 0 && x < g.length) g[y][x] = c;
+  };
+  const c0 = Math.floor(cx), c1 = Math.ceil(cx);
+  if (type === "pump") {
+    // Llama.
+    for (const [i, half, col] of [[0, 1, "#ff5d3a"], [1, 1, "#ff9f1c"], [2, 0, "#ffd166"]] as const)
+      for (let x = c0 - half; x <= c1 + half; x++) put(top - 1 - i, x, col);
+  } else if (type === "diamante") {
+    // Corona de cristales.
+    for (const [dx, h] of [[-3, 2], [0, 3], [3, 2]] as const)
+      for (let k = 0; k < h; k++) {
+        put(top - k, c0 + dx, k === h - 1 ? "#e0fbff" : "#5ad1ff");
+        if (dx === 0) put(top - k, c1, k === h - 1 ? "#e0fbff" : "#5ad1ff");
+      }
+  } else if (type === "ballena") {
+    // Chorro de agua.
+    for (let k = 1; k <= 3; k++) put(top - k, c0, k === 3 ? "#bfe9ff" : "#6cc4ff");
+    put(top - 3, c0 - 1, "#bfe9ff");
+    put(top - 3, c0 + 1, "#bfe9ff");
+  } else {
+    // Fantasma: aura.
+    for (let x = c0 - 2; x <= c1 + 2; x++) put(top - 1, x, "rgba(200,220,255,0.6)");
+  }
+}
+
+/** Contorno de 1 px alrededor de todo lo dibujado (salvo el aura translúcida). */
+function addOutline(g: Grid, color: string) {
+  const n = g.length;
+  const solid = g.map((row) => row.map((c) => c !== null && !c.startsWith("rgba")));
+  for (let y = 0; y < n; y++)
+    for (let x = 0; x < n; x++)
+      if (g[y][x] === null && [[1, 0], [-1, 0], [0, 1], [0, -1]].some(([dx, dy]) => solid[y + dy]?.[x + dx]))
+        g[y][x] = color;
+}
+
+function render(g: Grid, ghost: boolean) {
+  const c = document.createElement("canvas");
+  c.width = c.height = g.length;
+  const ctx = c.getContext("2d")!;
+  if (ghost) ctx.globalAlpha = 0.85;
+  g.forEach((row, y) =>
+    row.forEach((col, x) => {
+      if (!col) return;
+      ctx.fillStyle = col;
+      ctx.fillRect(x, y, 1, 1);
+    }),
+  );
+  return c.toDataURL();
+}
+
+// ---------------- estilo "logo" ----------------
+
+/** Reduce cada canal a pocos niveles para el aspecto de paleta limitada. */
+const posterize = (v: number) => Math.round(Math.round((v / 255) * 5) * (255 / 5));
+
+export function logoGrid(px: ImageData, type: MonType): Grid {
+  const N = 32;
+  const g = emptyGrid(N);
+  const off = { x: (N - LOGO_PX) / 2, y: N - LOGO_PX - 2 }; // deja hueco arriba para el accesorio
+  const r = LOGO_PX / 2;
+  for (let y = 0; y < LOGO_PX; y++) {
+    for (let x = 0; x < LOGO_PX; x++) {
+      // Recorte circular (casi todos los logos son redondos).
+      if ((x + 0.5 - r) ** 2 + (y + 0.5 - r) ** 2 > r * r) continue;
+      const i = (y * LOGO_PX + x) * 4;
+      if (px.data[i + 3] < 100) continue;
+      const [R, G, B] = [posterize(px.data[i]), posterize(px.data[i + 1]), posterize(px.data[i + 2])];
+      g[y + off.y][x + off.x] = `rgb(${R},${G},${B})`;
+    }
+  }
+  const cx = (N - 1) / 2;
+  // Patitas (las fantasma flotan).
+  if (type !== "fantasma") {
+    for (const x of [Math.round(cx - 5), Math.round(cx - 4), Math.round(cx + 4), Math.round(cx + 5)]) {
+      g[N - 2][x] = "#2a2a30";
+      g[N - 1][x] = "#2a2a30";
+    }
+  }
+  addAccessory(g, type, cx, off.y);
+  const hue = dominantHue(px) ?? 260;
+  addOutline(g, hsl(hue, 40, 12));
+  return g;
+}
+
+// ---------------- estilo "monstruo" ----------------
+
+export function monsterGrid(mint: string, type: MonType, hueOverride: number | null): Grid {
+  const N = 24;
   const r = rng(hashSeed("sprite", mint));
   const hue = hueOverride ?? r() * 360;
   const body = hsl(hue, 65, 55);
   const light = hsl(hue, 70, 70);
   const dark = hsl(hue, 55, 32);
   const outline = hsl(hue, 45, 14);
-  const g: Grid = Array.from({ length: N }, () => Array(N).fill(null));
+  const g = emptyGrid(N);
 
   // Cuerpo: elipse con bultos aleatorios, simétrica.
   const wide = type === "ballena" ? 1.25 : type === "pump" ? 0.85 : 1;
@@ -75,21 +190,15 @@ export function spriteGrid(mint: string, type: MonType, hueOverride: number | nu
     }
   }
   // Patas.
-  const legs = r() < 0.7;
-  if (legs) {
+  if (r() < 0.7) {
     const lx = Math.round(cx - rx * 0.5);
-    for (let y = cy + Math.round(ry) - 1; y < Math.min(N, cy + Math.round(ry) + 2); y++) {
-      g[y][lx] = g[y][N - 1 - lx] = dark;
-    }
+    for (let y = cy + Math.round(ry) - 1; y < Math.min(N, cy + Math.round(ry) + 2); y++) g[y][lx] = g[y][N - 1 - lx] = dark;
   }
-  // Fantasma: borde inferior ondulado y sin patas.
+  // Fantasma: borde inferior ondulado.
   if (type === "fantasma") {
     const bottom = cy + Math.round(ry);
-    for (let x = 0; x < N; x++) {
-      for (let y = bottom - 1; y < N; y++) g[y][x] = (x + y) % 3 === 0 ? null : g[y][x];
-    }
+    for (let x = 0; x < N; x++) for (let y = bottom - 1; y < N; y++) if ((x + y) % 3 === 0) g[y][x] = null;
   }
-
   // Ojos.
   const ey = cy - Math.round(ry * 0.25) - Math.floor(r() * 2);
   const ex = Math.round(cx - 1.5 - r() * 1.5);
@@ -101,72 +210,28 @@ export function spriteGrid(mint: string, type: MonType, hueOverride: number | nu
   }
   // Boca.
   if (r() < 0.75) {
-    const my = ey + 3;
     const w = 1 + Math.floor(r() * 2);
-    for (let x = Math.ceil(cx) - w; x <= Math.floor(cx) + w; x++) g[my][x] = outline;
+    for (let x = Math.ceil(cx) - w; x <= Math.floor(cx) + w; x++) g[ey + 3][x] = outline;
   }
-
-  // Accesorios por tipo.
-  const top = cy - Math.round(ry);
-  if (type === "pump") {
-    // Llama encima de la cabeza.
-    const flame = [[0, 1, "#ff5d3a"], [1, 1, "#ff9f1c"], [2, 0, "#ffd166"]] as const;
-    for (const [i, half, c] of flame) {
-      const y = top - 1 - i;
-      if (y < 0) continue;
-      for (let x = Math.floor(cx) - half; x <= Math.ceil(cx) + half; x++) g[y][x] = c;
-    }
-  } else if (type === "diamante") {
-    // Corona de cristales.
-    for (const [dx, h] of [[-3, 2], [0, 3], [3, 2]] as const) {
-      for (let k = 0; k < h; k++) {
-        const y = top - k;
-        const x = Math.round(cx) + dx;
-        if (y >= 0) g[y][x] = k === h - 1 ? "#e0fbff" : "#5ad1ff";
-      }
-    }
-  } else if (type === "ballena") {
-    // Chorro de agua.
-    for (let k = 1; k <= 3; k++) {
-      const y = top - k;
-      if (y >= 0) g[y][Math.round(cx)] = k === 3 ? "#bfe9ff" : "#6cc4ff";
-    }
-    if (top - 3 >= 0) {
-      g[top - 3][Math.round(cx) - 1] = "#bfe9ff";
-      g[top - 3][Math.round(cx) + 1] = "#bfe9ff";
-    }
-  } else {
-    // Fantasma: aura.
-    if (top - 1 >= 0) for (let x = Math.round(cx) - 2; x <= Math.round(cx) + 2; x++) g[top - 1][x] = "rgba(200,220,255,0.6)";
-  }
-
-  // Contorno: cualquier vacío junto a un píxel del cuerpo.
-  const filled = g.map((row) => row.map((c) => c !== null));
-  for (let y = 0; y < N; y++) {
-    for (let x = 0; x < N; x++) {
-      if (filled[y][x]) continue;
-      const near = [[1, 0], [-1, 0], [0, 1], [0, -1]].some(
-        ([dx, dy]) => filled[y + dy]?.[x + dx] && !String(g[y + dy][x + dx]).startsWith("rgba"),
-      );
-      if (near) g[y][x] = outline;
-    }
-  }
+  addAccessory(g, type, cx, cy - Math.round(ry));
+  addOutline(g, outline);
   return g;
 }
 
-/** Dibuja el sprite y devuelve una imagen PNG (data URL). */
-export function spriteDataUrl(mint: string, type: MonType, hue: number | null, scale = 1) {
-  const g = spriteGrid(mint, type, hue);
-  const c = document.createElement("canvas");
-  c.width = c.height = N * scale;
-  const ctx = c.getContext("2d")!;
-  if (type === "fantasma") ctx.globalAlpha = 0.85;
-  g.forEach((row, y) =>
-    row.forEach((col, x) => {
-      if (!col) return;
-      ctx.fillStyle = col;
-      ctx.fillRect(x * scale, y * scale, scale, scale);
-    }),
-  );
-  return c.toDataURL();
+// ---------------- API ----------------
+
+export type SpriteStyle = "logo" | "monster";
+
+/** Sprite inmediato (monstruo) para mostrar mientras carga el logo. */
+export const monsterSprite = (mint: string, type: MonType, hue: number | null = null) =>
+  render(monsterGrid(mint, type, hue), type === "fantasma");
+
+/**
+ * Sprite final: el logo pixelado si se puede leer; si no (o si se pide el
+ * estilo monstruo), el monstruo teñido con el color del logo cuando se conoce.
+ */
+export async function buildSprite(mint: string, type: MonType, image: string | undefined, style: SpriteStyle) {
+  const px = await logoPixels(image);
+  if (px && style === "logo") return { url: render(logoGrid(px, type), type === "fantasma"), fromLogo: true };
+  return { url: monsterSprite(mint, type, px ? dominantHue(px) : null), fromLogo: false };
 }

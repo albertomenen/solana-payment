@@ -389,3 +389,4 @@ strong.bump { display: inline-block; }
 .cta-bar { pointer-events: none; }
 .cta-bar .inner { pointer-events: auto; }
 .shell { padding-bottom: 160px; }
+.coin-logo { border-radius: 50%; object-fit: cover; flex-shrink: 0; background: var(--surface-2); }

@@ -1,7 +1,9 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { createContext, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { CoinData, DEMO_COINS, PRESETS, fetchCoin, searchCoins } from "./data";
 import { BattleEvent, Fighter, TYPE_INFO, hashSeed, makeFighter, maxHp, simulate } from "./engine";
-import { logoHue, spriteDataUrl } from "./sprite";
+import { SpriteStyle, buildSprite, monsterSprite } from "./sprite";
+
+const StyleCtx = createContext<SpriteStyle>("logo");
 
 // ---------------- utilidades ----------------
 
@@ -10,19 +12,25 @@ const fmtUsd = (v: number) =>
 const fmtPct = (v: number) => `${v > 0 ? "+" : ""}${v.toFixed(1)} %`;
 
 function useSprite(f: Fighter | null) {
+  const style = useContext(StyleCtx);
   const [url, setUrl] = useState<string | null>(null);
   useEffect(() => {
     if (!f) return setUrl(null);
     let alive = true;
-    setUrl(spriteDataUrl(f.coin.mint, f.type, null));
-    logoHue(f.coin.image).then((h) => {
-      if (alive && h !== null) setUrl(spriteDataUrl(f.coin.mint, f.type, h));
-    });
+    setUrl(monsterSprite(f.coin.mint, f.type)); // al instante, mientras carga el logo
+    buildSprite(f.coin.mint, f.type, f.coin.image, style).then((s) => alive && setUrl(s.url));
     return () => {
       alive = false;
     };
-  }, [f]);
+  }, [f, style]);
   return url;
+}
+
+/** Logo original (no necesita CORS para mostrarse). */
+function Logo({ f, size = 20 }: { f: Fighter; size?: number }) {
+  const [ok, setOk] = useState(true);
+  if (!f.coin.image || !ok) return null;
+  return <img className="coin-logo" src={f.coin.image} width={size} height={size} alt="" onError={() => setOk(false)} />;
 }
 
 function Sprite({ f, flip, className = "" }: { f: Fighter; flip?: boolean; className?: string }) {
@@ -113,7 +121,7 @@ function FighterCard({ f, side, onClear }: { f: Fighter; side: string; onClear: 
         <Sprite f={f} className="idle" />
         <div style={{ flex: 1, minWidth: 0 }}>
           <div className="muted" style={{ fontSize: "0.75rem" }}>{side}</div>
-          <div className="fc-name">{c.symbol} <span className={`type-pill t-${f.type}`}>{t.emoji} {t.label}</span></div>
+          <div className="fc-name"><Logo f={f} />{c.symbol} <span className={`type-pill t-${f.type}`}>{t.emoji} {t.label}</span></div>
           <div className="muted" style={{ fontSize: "0.78rem" }}>
             MC {fmtUsd(c.marketCap)} · 24 h {fmtPct(c.change.h24)}
             {f.z > 1.5 && " · ¡despierta!"}
@@ -189,7 +197,7 @@ function Arena({ f, seed, onExit, onRematch }: { f: [Fighter, Fighter]; seed: nu
     return (
       <div className={`arena-side s${i}`}>
         <div className="hpbox">
-          <div className="hp-name">{f[i].coin.symbol} <span>{TYPE_INFO[f[i].type].emoji}</span></div>
+          <div className="hp-name"><span style={{ display: "flex", gap: 5, alignItems: "center" }}><Logo f={f[i]} size={14} />{f[i].coin.symbol}</span> <span>{TYPE_INFO[f[i].type].emoji}</span></div>
           <div className="hp-track"><div className={`hp-fill ${pct < 25 ? "low" : pct < 50 ? "mid" : ""}`} style={{ width: `${pct}%` }} /></div>
           <div className="hp-num">{hp[i]} / {maxHp(f[i])}</div>
         </div>
@@ -236,6 +244,20 @@ function Arena({ f, seed, onExit, onRematch }: { f: [Fighter, Fighter]; seed: nu
 
 export function BattlePage() {
   const [demo, setDemo] = useState(false);
+  const [style, setStyle] = useState<SpriteStyle>(() => {
+    try {
+      return (localStorage.getItem("spriteStyle") as SpriteStyle) || "logo";
+    } catch {
+      return "logo";
+    }
+  });
+  useEffect(() => {
+    try {
+      localStorage.setItem("spriteStyle", style);
+    } catch {
+      /* sin almacenamiento */
+    }
+  }, [style]);
   const [coins, setCoins] = useState<[CoinData | null, CoinData | null]>([null, null]);
   const [seed, setSeed] = useState<number | null>(null);
 
@@ -251,15 +273,25 @@ export function BattlePage() {
 
   if (seed !== null && ready)
     return (
-      <Arena f={[fighters[0]!, fighters[1]!]} seed={seed}
-        onExit={() => setSeed(null)} onRematch={() => setSeed(hashSeed(String(seed), String(Date.now())))} />
+      <StyleCtx.Provider value={style}>
+        <Arena f={[fighters[0]!, fighters[1]!]} seed={seed}
+          onExit={() => setSeed(null)} onRematch={() => setSeed(hashSeed(String(seed), String(Date.now())))} />
+      </StyleCtx.Provider>
     );
 
   return (
-    <>
+    <StyleCtx.Provider value={style}>
       <div className="hero" style={{ paddingTop: 10 }}>
         <div className="big" style={{ fontSize: "1.7rem" }}>Batalla de memecoins</div>
         <div className="sub">Las estadísticas salen del mercado: no gana la más grande, sino la que mejor se mueve para lo que suele moverse.</div>
+      </div>
+
+      <div className="field">
+        <label>Aspecto de los luchadores</label>
+        <div className="segmented" data-pos={style === "logo" ? 0 : 1}>
+          <button className={style === "logo" ? "on" : ""} onClick={() => setStyle("logo")}>Logo en pixel art</button>
+          <button className={style === "monster" ? "on" : ""} onClick={() => setStyle("monster")}>Monstruo</button>
+        </div>
       </div>
 
       {([0, 1] as const).map((i) => (
@@ -300,6 +332,6 @@ export function BattlePage() {
           </button>
         </div>
       </div>
-    </>
+    </StyleCtx.Provider>
   );
 }

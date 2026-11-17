@@ -39,6 +39,8 @@ const IX = {
   resolveWithPrice: [147, 185, 42, 9, 42, 21, 90, 38],
 };
 const BET_DISCRIMINATOR = new Uint8Array([147, 23, 35, 59, 15, 75, 155, 32]);
+/** Tamaño de la cuenta Bet (8 + Bet::INIT_SPACE). Las de versiones anteriores no coinciden. */
+const BET_SIZE = 469;
 
 /** Mensajes de `programs/wager/src/errors.rs` (códigos 6000+). */
 export const PROGRAM_ERRORS = [
@@ -204,6 +206,7 @@ export function decodeBet(address: PublicKey, data: Uint8Array): Bet {
   for (let i = 0; i < 8; i++) {
     if (data[i] !== BET_DISCRIMINATOR[i]) throw new Error("No es una cuenta Bet");
   }
+  if (data.length !== BET_SIZE) throw new Error("Apuesta de una versión anterior del programa");
   const r = new Reader(data.subarray(8));
   const bet = {
     address,
@@ -234,7 +237,7 @@ export async function fetchBet(conn: Connection, address: PublicKey) {
 
 export async function fetchAllBets(conn: Connection): Promise<Bet[]> {
   const accounts = await conn.getProgramAccounts(PROGRAM_ID, {
-    filters: [{ memcmp: { offset: 0, bytes: bs58.encode(BET_DISCRIMINATOR) } }],
+    filters: [{ dataSize: BET_SIZE }, { memcmp: { offset: 0, bytes: bs58.encode(BET_DISCRIMINATOR) } }],
   });
   // Las apuestas creadas con versiones antiguas del programa se ignoran.
   return accounts.flatMap((a) => {

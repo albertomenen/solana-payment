@@ -6,7 +6,7 @@ import { getMint } from "@solana/spl-token";
 import type React from "react";
 import { DEFAULT_MINT, PROGRAM_ID } from "./config";
 import { BattlePage } from "./battle/BattlePage";
-import { FEEDS, THRESHOLD_EXPO, feedSymbol, fromHex, latestPrice, resolveWithPyth, scaled, toHex } from "./pyth";
+import { FEEDS, OnchainPrice, PRICE_WINDOW, THRESHOLD_EXPO, feedSymbol, fromHex, readPushPrice, resolveWithPushIx, scaled, toHex } from "./pyth";
 import {
   Bet,
   BetStatus,
@@ -290,21 +290,22 @@ function useBalances(mintStr: string, refresh: unknown) {
   return { sol, token, decimals };
 }
 
-/** Precio en vivo de un feed de Pyth (se refresca cada 10 s). */
+/** Último precio de Pyth publicado on-chain para un feed (se refresca cada 15 s). */
 function useLivePrice(feedHex: string | null) {
-  const [price, setPrice] = useState<number | null>(null);
+  const { connection } = useConnection();
+  const [price, setPrice] = useState<OnchainPrice | null>(null);
   useEffect(() => {
     setPrice(null);
     if (!feedHex) return;
     let alive = true;
-    const load = () => latestPrice(feedHex).then((p) => alive && setPrice(p)).catch(() => {});
+    const load = () => readPushPrice(connection, feedHex).then((p) => alive && setPrice(p)).catch(() => {});
     load();
-    const id = setInterval(load, 10_000);
+    const id = setInterval(load, 15_000);
     return () => {
       alive = false;
       clearInterval(id);
     };
-  }, [feedHex]);
+  }, [connection, feedHex]);
   return price;
 }
 
@@ -443,7 +444,8 @@ function statusInfo(b: Bet): { text: string; cls: string } {
   if (b.status === BetStatus.Open)
     return b.acceptDeadline > t ? { text: "Esperando rival", cls: "warn" } : { text: "Caducada", cls: "" };
   if (b.status === BetStatus.Matched) {
-    if (b.resolveDeadline <= t) return { text: "Plazo vencido", cls: "warn" };
+    if (b.resolveDeadline <= t || (b.condition && b.condition.resolveAt + PRICE_WINDOW < t))
+      return { text: "Plazo vencido", cls: "warn" };
     if (b.condition && b.condition.resolveAt <= t) return { text: "Lista para resolver", cls: "warn" };
     return { text: "En juego", cls: "live" };
   }
@@ -537,7 +539,7 @@ const PRICE_AT_OPTS = [
   { label: "1 semana", s: 604800 },
   { label: "1 mes", s: 2592000 },
 ];
-const WEEK = 604800;
+const DAY = 86400;
 
 function CreateBet() {
   const { publicKey } = useWallet();
@@ -564,7 +566,7 @@ function CreateBet() {
   // Al cambiar de activo, proponer el precio actual como umbral.
   useEffect(() => setThresholdStr(""), [feed]);
   useEffect(() => {
-    if (livePrice !== null && !thresholdStr) setThresholdStr(String(Math.round(livePrice)));
+    if (livePrice !== null && !thresholdStr) setThresholdStr(String(Math.round(livePrice.price)));
   }, [livePrice, thresholdStr]);
   // En apuestas de precio, aceptar siempre antes de que se mire el precio.
   useEffect(() => {
@@ -620,7 +622,7 @@ function CreateBet() {
       opponent: opp instanceof PublicKey ? opp : null,
       arbiter: !isPrice && arb instanceof PublicKey ? arb : null,
       acceptDeadline: t + acceptS,
-      resolveDeadline: isPrice ? t + priceAtS + WEEK : t + resolveS,
+      resolveDeadline: isPrice ? t + priceAtS + DAY : t + resolveS,
       condition: isPrice
         ? {
             feedId: fromHex(feed.id),
@@ -692,7 +694,7 @@ function CreateBet() {
                 <button key={f.id} className={`chip ${feed.id === f.id ? "on" : ""}`} onClick={() => setFeed(f)}>{f.symbol}</button>
               ))}
             </div>
-            <p className="hint">{livePrice === null ? "Consultando precio en Pyth…" : `Ahora: ${fmtUsd(livePrice)}`}</p>
+            <p className="hint">{livePrice === null ? "Consultando precio en Pyth…" : `Ahora: ${fmtUsd(livePrice.price)} (Pyth)`}</p>
           </div>
           <div className="field">
             <label>Tú apuestas a que {feed.symbol} estará…</label>
@@ -718,7 +720,7 @@ function CreateBet() {
             <span className="dot" />
             <div>
               Ganas tú si <strong>{priceSentence(now())}</strong>. Si no, gana tu rival.
-              Lo decide el precio oficial de Pyth: nadie tiene que votar.
+              Lo decide el primer precio oficial de Pyth publicado a partir de esa hora: nadie tiene que votar.
             </div>
           </div>
         </div>
@@ -793,7 +795,7 @@ function CreateBet() {
 
 function BetView({ address }: { address: string }) {
   const { connection } = useConnection();
-  const { publicKey, signTransaction, signAllTransactions } = useWallet();
+  const { publicKey } = useWallet();
   const { send, run, busy, msg } = useSend();
   const [bet, setBet] = useState<Bet | null | undefined>(undefined);
   const [loadError, setLoadError] = useState("");
@@ -801,7 +803,6 @@ function BetView({ address }: { address: string }) {
   const [choice, setChoice] = useState<Outcome | null>(null);
   const [copied, setCopied] = useState(false);
   const [settled, setSettled] = useState(false);
-  const [resolvedPrice, setResolvedPrice] = useState<number | null>(null);
 
   const key = useMemo(() => {
     try {
@@ -901,18 +902,11 @@ function BetView({ address }: { address: string }) {
     (!bet.opponent || bet.opponent.toBase58() === me);
   const canVote = !cond && (isCreator || isAcceptor) && bet.status === BetStatus.Matched && t <= bet.resolveDeadline;
   const canArbitrate = !cond && isArbiter && bet.status === BetStatus.Matched && t <= bet.resolveDeadline;
-  const canResolvePyth =
-    !!cond && !!publicKey && !!signAllTransactions && bet.status === BetStatus.Matched &&
-    t >= cond.resolveAt && t <= bet.resolveDeadline;
-
-  const resolvePyth = async () => {
-    const done = await run(async () => {
-      const price = await resolveWithPyth(connection, { publicKey: publicKey!, signTransaction, signAllTransactions: signAllTransactions! }, bet);
-      setResolvedPrice(price);
-      return undefined;
-    }, "Resuelta con el precio de Pyth");
-    if (done) await reload();
-  };
+  const windowEnd = cond ? cond.resolveAt + PRICE_WINDOW : 0;
+  const inWindow = !!cond && bet.status === BetStatus.Matched && t >= cond.resolveAt && t <= windowEnd;
+  const priceReady =
+    !!livePrice && !!cond && livePrice.publishTime >= cond.resolveAt && livePrice.publishTime <= windowEnd;
+  const refundable = t > bet.resolveDeadline || (!!cond && t > windowEnd);
   const myVote = isCreator ? bet.creatorVote : isAcceptor ? bet.acceptorVote : null;
   const lowBalance = token !== null && token < bet.stake;
   const iWon =
@@ -959,8 +953,7 @@ function BetView({ address }: { address: string }) {
           <>
             <div className="line"><span>Decide</span><strong>Oráculo Pyth · {condSym}/USD</strong></div>
             <div className="line"><span>Se mira el precio</span><strong>{fmtDate(cond.resolveAt)}</strong></div>
-            <div className="line"><span>Precio ahora</span><strong>{livePrice === null ? "…" : fmtUsd(livePrice)}</strong></div>
-            {resolvedPrice !== null && <div className="line"><span>Precio en ese momento</span><strong>{fmtUsd(resolvedPrice)}</strong></div>}
+            <div className="line"><span>Último precio de Pyth</span><strong>{livePrice === null ? "…" : fmtUsd(livePrice.price)}</strong></div>
           </>
         ) : (
           <div className="line"><span>Se decide antes de</span><strong>{fmtDate(bet.resolveDeadline)}</strong></div>
@@ -1021,16 +1014,18 @@ function BetView({ address }: { address: string }) {
 
       {cond && bet.status === BetStatus.Matched && t < cond.resolveAt && (
         <p className="hint center">
-          El {fmtDate(cond.resolveAt)} se mirará el precio de {condSym} en Pyth. A partir de entonces cualquiera puede resolverla.
+          A partir del {fmtDate(cond.resolveAt)} vale el primer precio de {condSym} que publique Pyth.
+          Un bot la resuelve y la paga solo; también puedes hacerlo tú desde aquí.
         </p>
       )}
 
-      {canResolvePyth && (
+      {inWindow && (
         <>
-          <button data-busy={busy || undefined} className="btn" disabled={busy} onClick={resolvePyth}>
-            {busy ? "Confirma en tu wallet" : "Resolver con el precio de Pyth"}
+          <button data-busy={busy || undefined} className="btn" disabled={busy || !publicKey || !priceReady}
+            onClick={() => act([resolveWithPushIx(bet)], "Resuelta con el precio de Pyth")}>
+            {busy ? "Confirma en tu wallet" : priceReady ? `Resolver con ${fmtUsd(livePrice!.price)}` : "Esperando el siguiente precio de Pyth…"}
           </button>
-          <p className="hint center">Phantom te pedirá firmar varias transacciones: publican el precio firmado y resuelven la apuesta.</p>
+          <p className="hint center">El primer precio registrado es definitivo. Si nadie resuelve antes del {fmtDate(windowEnd)}, se devuelve el dinero.</p>
         </>
       )}
 
@@ -1041,7 +1036,7 @@ function BetView({ address }: { address: string }) {
         </button>
       )}
 
-      {publicKey && bet.status === BetStatus.Matched && t > bet.resolveDeadline && (
+      {publicKey && bet.status === BetStatus.Matched && refundable && (
         <button data-busy={busy || undefined} className="btn" disabled={busy}
           onClick={async () => setSettled(await act(settleIxs(bet, publicKey, true), "Dinero devuelto a los dos"))}>
           Recuperar mi dinero

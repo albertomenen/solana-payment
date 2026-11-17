@@ -73,13 +73,13 @@ pub fn create_bet(ctx: Context<CreateBet>, args: CreateBetArgs) -> Result<()> {
         );
     }
     if let Some(cond) = &args.condition {
-        // Nadie puede aceptar cuando ya se conoce el precio, y debe quedar
-        // margen para resolver antes de que se active el reembolso.
+        // Nadie puede aceptar cuando ya se conoce el precio, y la ventana de
+        // resolución debe caber antes de `resolve_deadline`.
         require!(
             args.accept_deadline <= cond.resolve_at
                 && cond
                     .resolve_at
-                    .checked_add(MIN_RESOLVE_WINDOW)
+                    .checked_add(PRICE_WINDOW)
                     .is_some_and(|t| t <= args.resolve_deadline),
             WagerError::InvalidDeadlines
         );

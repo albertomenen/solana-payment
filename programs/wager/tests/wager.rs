@@ -18,7 +18,7 @@ use solana_transaction::Transaction;
 use wager::{
     errors::WagerError,
     instructions::CreateBetArgs,
-    state::{Bet, BetStatus, Outcome, PriceCondition, BET_SEED, VAULT_SEED},
+    state::{Bet, BetStatus, Outcome, PriceCondition, BET_SEED, PRICE_WINDOW, VAULT_SEED},
 };
 
 /// Comprueba que la transacción falló con el error esperado (no por otro motivo).
@@ -840,18 +840,20 @@ async fn pyth_resolution_rejects_bad_prices() {
     env.warp_to(t + 120).await;
     let p = 310 * 100_000_000;
 
-    // Precio de otro momento: ni el canónico de t, ni demasiado tarde.
-    let later = env.set_price(SOL_FEED, p, t + 10, t + 11, VerificationLevel::Full, PYTH);
-    assert_err(
-        env.resolve_with_price(bet, later).await,
-        code(WagerError::WrongPriceTime),
-    );
+    // Precio anterior a la hora acordada o fuera de la ventana.
     let earlier = env.set_price(SOL_FEED, p, t - 5, t - 1, VerificationLevel::Full, PYTH);
     assert_err(
         env.resolve_with_price(bet, earlier).await,
         code(WagerError::WrongPriceTime),
     );
-    let too_late = env.set_price(SOL_FEED, p, t - 1, t + 61, VerificationLevel::Full, PYTH);
+    let too_late = env.set_price(
+        SOL_FEED,
+        p,
+        t,
+        t + PRICE_WINDOW + 1,
+        VerificationLevel::Full,
+        PYTH,
+    );
     assert_err(
         env.resolve_with_price(bet, too_late).await,
         code(WagerError::WrongPriceTime),
@@ -912,7 +914,7 @@ async fn price_bet_creation_rules() {
         .create_bet_with(30, None, None, now + 2 * HOUR, now + 30 * HOUR, Some(cond))
         .await;
     assert_err(res, code(WagerError::InvalidDeadlines));
-    // Debe quedar al menos una hora para resolver.
+    // La ventana de resolución debe caber antes de resolve_deadline.
     let res = env
         .create_bet_with(31, None, None, now + 60, now + HOUR + 60, Some(cond))
         .await;
@@ -941,6 +943,52 @@ async fn unresolved_price_bet_is_refunded() {
     let (bet, _) = matched_price_bet(&mut env, 23).await;
     let deadline = env.bet(bet).await.resolve_deadline;
     env.warp_to(deadline + 1).await;
+    env.refund_expired(bet).await.unwrap();
+    assert_eq!(env.balance(env.creator_token).await, INITIAL);
+    assert_eq!(env.balance(env.acceptor_token).await, INITIAL);
+}
+
+#[tokio::test]
+async fn first_price_in_window_is_final() {
+    let mut env = Env::new().await;
+    let (bet, t) = matched_price_bet(&mut env, 24).await;
+    env.warp_to(t + 200).await;
+    // Primer precio publicado tras la hora acordada: gana el rival.
+    let low = env.set_price(
+        SOL_FEED,
+        290 * 100_000_000,
+        t + 50,
+        t + 90,
+        VerificationLevel::Full,
+        PYTH,
+    );
+    env.resolve_with_price(bet, low).await.unwrap();
+    // Un precio posterior que favorecería al creador ya no cambia nada.
+    let high = env.set_price(
+        SOL_FEED,
+        320 * 100_000_000,
+        t + 150,
+        t + 180,
+        VerificationLevel::Full,
+        PYTH,
+    );
+    assert_err(
+        env.resolve_with_price(bet, high).await,
+        code(WagerError::InvalidStatus),
+    );
+    assert_eq!(env.bet(bet).await.outcome, Some(Outcome::AcceptorWins));
+}
+
+#[tokio::test]
+async fn price_bet_refunds_right_after_the_window() {
+    let mut env = Env::new().await;
+    let (bet, t) = matched_price_bet(&mut env, 25).await;
+    env.warp_to(t + PRICE_WINDOW).await;
+    assert_err(
+        env.refund_expired(bet).await,
+        code(WagerError::ResolveDeadlineNotReached),
+    );
+    env.warp_to(t + PRICE_WINDOW + 1).await;
     env.refund_expired(bet).await.unwrap();
     assert_eq!(env.balance(env.creator_token).await, INITIAL);
     assert_eq!(env.balance(env.acceptor_token).await, INITIAL);

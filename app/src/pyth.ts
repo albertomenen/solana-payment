@@ -1,8 +1,15 @@
-// Oráculo de precios de Pyth: precios en vivo (Hermes) y resolución on-chain.
-import { Connection, PublicKey, VersionedTransaction } from "@solana/web3.js";
+// Oráculo de precios de Pyth, sin API de pago: Pyth mantiene en Solana una
+// cuenta pública por feed (PriceUpdateV2, totalmente verificada) que se
+// actualiza sola. La web la lee para mostrar el precio y la pasa al programa
+// para resolver.
+import { Connection, PublicKey } from "@solana/web3.js";
 import { Bet, resolveWithPriceIx } from "./wager";
 
-const HERMES = "https://hermes.pyth.network";
+/** Programa de Pyth que mantiene las cuentas de precio patrocinadas. */
+const PUSH_ORACLE = new PublicKey("pythWSnswVUd12oZpeFP8e9CVaEqJg25g1Vtc2biRsT");
+
+/** Ventana tras la hora acordada en la que se acepta un precio (como en el programa). */
+export const PRICE_WINDOW = 1800;
 
 /** Feeds de Pyth (los mismos ids en devnet y mainnet). */
 export const FEEDS = [
@@ -25,60 +32,34 @@ export function feedSymbol(feedId: Uint8Array) {
 /** Valor real de `value * 10^expo`. */
 export const scaled = (value: bigint, expo: number) => Number(value) * 10 ** expo;
 
-interface HermesResponse {
-  binary: { data: string[] };
-  parsed: { id: string; price: { price: string; expo: number; publish_time: number } }[];
+/** Dirección de la cuenta de precio patrocinada (shard 0) de un feed. */
+export function pushFeedAddress(feedHex: string) {
+  const shard = new Uint8Array(2); // u16 LE = 0
+  return PublicKey.findProgramAddressSync([shard, fromHex(feedHex)], PUSH_ORACLE)[0];
 }
 
-async function hermes(path: string): Promise<HermesResponse> {
-  const res = await fetch(`${HERMES}${path}`);
-  if (!res.ok) throw new Error(`Pyth no respondió (${res.status})`);
-  return res.json();
+export interface OnchainPrice {
+  price: number;
+  publishTime: number;
+  address: PublicKey;
 }
 
-/** Precio actual en dólares. */
-export async function latestPrice(feedHex: string): Promise<number> {
-  const r = await hermes(`/v2/updates/price/latest?ids[]=${feedHex}&parsed=true`);
-  const p = r.parsed[0].price;
-  return Number(p.price) * 10 ** p.expo;
+/** Lee el último precio publicado on-chain para un feed. */
+export async function readPushPrice(connection: Connection, feedHex: string): Promise<OnchainPrice> {
+  const address = pushFeedAddress(feedHex);
+  const acc = await connection.getAccountInfo(address);
+  if (!acc) throw new Error("Pyth no tiene cuenta de precio para este activo en esta red");
+  const d = new DataView(acc.data.buffer, acc.data.byteOffset, acc.data.byteLength);
+  // discriminador (8) + write_authority (32) + verification_level (1 o 2) + feed_id (32)
+  let o = 8 + 32;
+  o += acc.data[o] === 0 ? 2 : 1;
+  o += 32;
+  const price = d.getBigInt64(o, true);
+  const expo = d.getInt32(o + 16, true);
+  const publishTime = Number(d.getBigInt64(o + 20, true));
+  return { price: scaled(price, expo), publishTime, address };
 }
 
-/** Actualización firmada del precio en el instante `t` (la primera con publish_time >= t). */
-async function updateAt(feedHex: string, t: number) {
-  const r = await hermes(`/v2/updates/price/${t}?ids[]=${feedHex}&encoding=base64&parsed=true`);
-  const p = r.parsed[0].price;
-  return { data: r.binary.data, price: Number(p.price) * 10 ** p.expo, publishTime: p.publish_time };
-}
-
-type SignAll = <T extends VersionedTransaction>(txs: T[]) => Promise<T[]>;
-
-/**
- * Publica en Solana el precio firmado de `resolve_at` (verificación completa
- * de Wormhole) y, en la misma tanda, llama a `resolve_with_price`.
- * Phantom pide firmar varias transacciones de golpe.
- */
-export async function resolveWithPyth(
-  connection: Connection,
-  wallet: { publicKey: PublicKey; signTransaction: unknown; signAllTransactions: SignAll },
-  bet: Bet,
-) {
-  const cond = bet.condition!;
-  const feedHex = toHex(cond.feedId);
-  const update = await updateAt(feedHex, cond.resolveAt);
-
-  // El SDK de Pyth (con Anchor) es pesado: se carga solo al resolver.
-  const { PythSolanaReceiver } = await import("@pythnetwork/pyth-solana-receiver");
-  const receiver = new PythSolanaReceiver({
-    connection,
-    // El SDK espera la interfaz de wallet de Anchor.
-    wallet: wallet as unknown as ConstructorParameters<typeof PythSolanaReceiver>[0]["wallet"],
-  });
-  const builder = receiver.newTransactionBuilder({ closeUpdateAccounts: true });
-  await builder.addPostPriceUpdates(update.data);
-  await builder.addPriceConsumerInstructions(async (getPriceUpdateAccount) => [
-    { instruction: resolveWithPriceIx(bet, getPriceUpdateAccount(`0x${feedHex}`)), signers: [] },
-  ]);
-  const txs = await builder.buildVersionedTransactions({ computeUnitPriceMicroLamports: 50_000 });
-  await receiver.provider.sendAll(txs, { skipPreflight: true, commitment: "confirmed" });
-  return update.price;
-}
+/** Instrucción para resolver con la cuenta de precio patrocinada. */
+export const resolveWithPushIx = (bet: Bet) =>
+  resolveWithPriceIx(bet, pushFeedAddress(toHex(bet.condition!.feedId)));

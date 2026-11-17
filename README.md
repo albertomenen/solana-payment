@@ -21,7 +21,7 @@ create_bet ──► accept_bet ──► submit_result (ambos coinciden) ──
 | `cancel_bet`      | creador       | Mientras nadie la haya aceptado, recupera su dinero y cierra las cuentas |
 | `submit_result`   | participantes | Cada uno vota `CreatorWins`, `AcceptorWins` o `Draw`. Si ambos coinciden, queda resuelta. Se puede cambiar el voto |
 | `arbiter_resolve` | árbitro       | Decide el resultado si se configuró un árbitro (p. ej. ante un desacuerdo) |
-| `resolve_with_price` | cualquiera | Apuestas de precio: resuelve con el precio firmado de Pyth del momento acordado |
+| `resolve_with_price` | cualquiera | Apuestas de precio: resuelve con el primer precio de Pyth publicado tras la hora acordada |
 | `settle`          | cualquiera    | Paga al ganador (o devuelve cada parte si es `Draw`) y cierra las cuentas |
 | `refund_expired`  | cualquiera    | Pasado `resolve_deadline` sin resultado, devuelve a cada uno lo suyo |
 
@@ -29,19 +29,25 @@ create_bet ──► accept_bet ──► submit_result (ambos coinciden) ──
 token cuyo dueño sea el creador o el aceptante, así que un bot puede liquidar
 automáticamente.
 
-### Apuestas de precio (oráculo de Pyth)
+### Apuestas de precio (oráculo de Pyth, gratis)
 
 Al crear la apuesta se puede añadir una `PriceCondition`: un feed de Pyth (p. ej.
-SOL/USD), un umbral, si el creador gana por encima o por debajo y el instante
-`resolve_at`. Estas apuestas no se votan ni tienen árbitro: a partir de `resolve_at`
-cualquiera publica el precio firmado de Pyth y llama a `resolve_with_price`.
+SOL/USD), un umbral, si el creador gana por encima o por debajo y la hora `resolve_at`.
+Estas apuestas no se votan ni tienen árbitro.
 
-El programa solo acepta la actualización **canónica** de ese instante
-(`prev_publish_time < resolve_at <= publish_time`, con un margen máximo de 60 s),
-con verificación completa de Wormhole y del feed acordado, así que nadie puede elegir
-un precio que le convenga. Además, hay que aceptar antes de `resolve_at`, y
-`resolve_deadline` deja al menos una hora para resolver antes de que se active el
-reembolso.
+No usamos la API de pago de Pyth (Hermes exige clave desde la actualización Pyth Core
+de agosto de 2026). En su lugar se lee la **cuenta de precio pública que Pyth mantiene
+en Solana** para cada feed (`PriceUpdateV2`, totalmente verificada, propiedad del
+receptor oficial de Pyth), que es gratis de leer.
+
+`resolve_with_price` acepta el primer precio publicado en la ventana
+`[resolve_at, resolve_at + 30 min]` del feed acordado y con verificación completa. El
+primer precio registrado es definitivo. Si nadie resuelve dentro de la ventana, se puede
+reembolsar a ambos en cuanto se cierra.
+
+**Bot keeper** (`keeper/keeper.ts`, `.github/workflows/keeper.yml`): cada 5 minutos
+resuelve las apuestas de precio en cuanto hay precio, paga las resueltas y reembolsa las
+vencidas. Solo usa instrucciones sin permisos, así que no puede desviar dinero.
 
 ### Cuentas
 - **`Bet`**: PDA `["bet", creator, bet_id (u64 LE)]` con los participantes, el importe,
@@ -80,6 +86,7 @@ programs/wager/src/
 └── instructions/        # una instrucción por fichero
 programs/wager/tests/
 └── wager.rs             # tests de integración (solana-program-test)
+keeper/keeper.ts         # bot que resuelve, paga y reembolsa (GitHub Actions)
 app/                     # web (React + Vite + wallet adapter)
 └── src/wager.ts         # cliente del programa (codificación Borsh a mano)
 .github/workflows/devnet.yml

@@ -60,12 +60,14 @@ pub struct ResolveWithPrice<'info> {
     #[account(mut)]
     pub bet: Account<'info, Bet>,
     /// Precio verificado por el programa receptor de Pyth (Anchor comprueba
-    /// el dueño y el discriminador de la cuenta).
+    /// el dueño y el discriminador de la cuenta). Normalmente es la cuenta
+    /// pública que Pyth mantiene actualizada para cada feed (gratis de leer).
     pub price_update: Account<'info, PriceUpdateV2>,
 }
 
-/// Resuelve una apuesta de precio con el precio de Pyth del momento acordado.
-/// Sin permisos: cualquiera puede llamarla porque el precio está firmado.
+/// Resuelve una apuesta de precio con un precio de Pyth publicado dentro de la
+/// ventana `[resolve_at, resolve_at + PRICE_WINDOW]`. Sin permisos: cualquiera
+/// puede llamarla (p. ej. el bot), y el primer precio registrado es definitivo.
 pub fn resolve_with_price(ctx: Context<ResolveWithPrice>) -> Result<()> {
     let bet = &mut ctx.accounts.bet;
     let cond = bet.condition.ok_or(WagerError::NotAnOracleBet)?;
@@ -82,12 +84,9 @@ pub fn resolve_with_price(ctx: Context<ResolveWithPrice>) -> Result<()> {
     );
     let msg = &update.price_message;
     require!(msg.feed_id == cond.feed_id, WagerError::WrongPriceFeed);
-    // La actualización "canónica" del instante t es la única que cumple
-    // prev_publish_time < t <= publish_time, así nadie puede elegir otra.
     require!(
-        msg.prev_publish_time < cond.resolve_at
-            && cond.resolve_at <= msg.publish_time
-            && msg.publish_time - cond.resolve_at <= MAX_PRICE_DELAY,
+        cond.resolve_at <= msg.publish_time
+            && msg.publish_time <= cond.resolve_at.saturating_add(PRICE_WINDOW),
         WagerError::WrongPriceTime
     );
 

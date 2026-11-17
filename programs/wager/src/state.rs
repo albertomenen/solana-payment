@@ -3,10 +3,9 @@ use anchor_lang::prelude::*;
 pub const BET_SEED: &[u8] = b"bet";
 pub const VAULT_SEED: &[u8] = b"vault";
 pub const MAX_DESCRIPTION_LEN: usize = 200;
-/// Margen máximo entre `resolve_at` y el precio de Pyth que se use.
-pub const MAX_PRICE_DELAY: i64 = 60;
-/// Tiempo mínimo entre `resolve_at` y `resolve_deadline` para poder resolver.
-pub const MIN_RESOLVE_WINDOW: i64 = 3600;
+/// Ventana tras `resolve_at` en la que se acepta un precio de Pyth. Vale el
+/// primero que alguien registre: después ya no se puede cambiar.
+pub const PRICE_WINDOW: i64 = 1800;
 
 /// Condición de precio resuelta por el oráculo de Pyth: "el precio de
 /// `feed_id` en `resolve_at` está por encima (o por debajo) de `threshold`".
@@ -20,8 +19,19 @@ pub struct PriceCondition {
     /// `true`: gana el creador si el precio es mayor que el umbral.
     /// `false`: gana el creador si el precio es menor que el umbral.
     pub above: bool,
-    /// Momento (unix) en que se mira el precio.
+    /// Momento (unix) a partir del cual se mira el precio.
     pub resolve_at: i64,
+}
+
+impl Bet {
+    /// ¿Puede reembolsarse ya? Al vencer `resolve_deadline` o, en apuestas de
+    /// precio, en cuanto pasa la ventana sin que nadie la haya resuelto.
+    pub fn refundable_at(&self, now: i64) -> bool {
+        now > self.resolve_deadline
+            || self
+                .condition
+                .is_some_and(|c| now > c.resolve_at.saturating_add(PRICE_WINDOW))
+    }
 }
 
 impl PriceCondition {

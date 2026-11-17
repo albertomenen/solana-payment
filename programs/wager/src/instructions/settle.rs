@@ -41,7 +41,7 @@ pub fn refund_expired(ctx: Context<Settle>) -> Result<()> {
     let bet = &ctx.accounts.bet;
     require!(bet.status == BetStatus::Matched, WagerError::InvalidStatus);
     require!(
-        Clock::get()?.unix_timestamp > bet.resolve_deadline,
+        bet.refundable_at(Clock::get()?.unix_timestamp),
         WagerError::ResolveDeadlineNotReached
     );
     payout(ctx.accounts, Outcome::Draw)

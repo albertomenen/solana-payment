@@ -11,6 +11,8 @@ pub struct CreateBetArgs {
     pub arbiter: Option<Pubkey>,
     pub accept_deadline: i64,
     pub resolve_deadline: i64,
+    /// Si se indica, la apuesta la resuelve el oráculo de Pyth.
+    pub condition: Option<PriceCondition>,
 }
 
 #[derive(Accounts)]
@@ -70,6 +72,23 @@ pub fn create_bet(ctx: Context<CreateBet>, args: CreateBetArgs) -> Result<()> {
             WagerError::ArbiterIsParticipant
         );
     }
+    if let Some(cond) = &args.condition {
+        // Nadie puede aceptar cuando ya se conoce el precio, y la ventana de
+        // resolución debe caber antes de `resolve_deadline`.
+        require!(
+            args.accept_deadline <= cond.resolve_at
+                && cond
+                    .resolve_at
+                    .checked_add(PRICE_WINDOW)
+                    .is_some_and(|t| t <= args.resolve_deadline),
+            WagerError::InvalidDeadlines
+        );
+        require!(args.arbiter.is_none(), WagerError::OracleBet);
+        require!(
+            (-18..=18).contains(&cond.expo),
+            WagerError::InvalidCondition
+        );
+    }
 
     ctx.accounts.bet.set_inner(Bet {
         creator,
@@ -87,6 +106,7 @@ pub fn create_bet(ctx: Context<CreateBet>, args: CreateBetArgs) -> Result<()> {
         status: BetStatus::Open,
         bump: ctx.bumps.bet,
         vault_bump: ctx.bumps.vault,
+        condition: args.condition,
         description: args.description,
     });
 

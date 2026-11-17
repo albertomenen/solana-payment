@@ -302,3 +302,91 @@ strong.bump { display: inline-block; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; transition-duration: 0.01ms !important; }
 }
+
+/* ================= batallas ================= */
+.sprite { width: 96px; height: 96px; image-rendering: pixelated; display: block; }
+.sprite.flip { transform: scaleX(-1); }
+.fighter-card { background: var(--surface); border-radius: var(--radius); padding: 14px; }
+.fc-head { display: flex; gap: 12px; align-items: center; margin-bottom: 8px; }
+.fc-head .sprite { width: 72px; height: 72px; }
+.fc-name { font-weight: 800; font-size: 1.1rem; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.type-pill { font-size: 0.7rem; font-weight: 700; padding: 3px 8px; border-radius: 99px; background: var(--surface-2); }
+.t-pump { color: #ff9f1c; } .t-ballena { color: #6cc4ff; } .t-diamante { color: #8ee8ff; } .t-fantasma { color: #c9b8ff; }
+.statbar { display: grid; grid-template-columns: 76px 1fr 32px; gap: 8px; align-items: center; font-size: 0.8rem; margin-top: 6px; }
+.statbar span { color: var(--muted); }
+.statbar strong { text-align: right; }
+.statbar .track { height: 8px; background: var(--surface-2); border-radius: 99px; overflow: hidden; }
+.statbar .fill { height: 100%; background: var(--accent); border-radius: 99px; animation: grow 0.7s var(--ease-out) both; transform-origin: left; }
+@keyframes grow { from { transform: scaleX(0); } }
+
+.arena {
+  position: relative; height: 330px; border-radius: var(--radius); overflow: hidden; margin-top: 8px;
+  background:
+    radial-gradient(ellipse 38% 9% at 72% 40%, rgba(255,255,255,0.10), transparent 70%),
+    radial-gradient(ellipse 42% 10% at 28% 86%, rgba(255,255,255,0.10), transparent 70%),
+    linear-gradient(180deg, #2a2346 0%, #1d1a2e 55%, #17161f 100%);
+}
+.arena::after { /* scanlines retro */
+  content: ""; position: absolute; inset: 0; pointer-events: none;
+  background: repeating-linear-gradient(0deg, rgba(0,0,0,0.12) 0 1px, transparent 1px 3px);
+}
+.arena-side { position: absolute; display: flex; align-items: flex-end; gap: 10px; }
+.arena-side.s1 { top: 18px; right: 14px; flex-direction: row; }
+.arena-side.s0 { bottom: 16px; left: 14px; flex-direction: row-reverse; }
+.arena-side .sprite { width: 120px; height: 120px; }
+.sprite-wrap { position: relative; }
+.hpbox { background: rgba(10,10,14,0.75); border: 2px solid #3b3756; border-radius: 10px; padding: 8px 10px; width: 150px; font-size: 0.75rem; }
+.hp-name { font-weight: 800; display: flex; justify-content: space-between; }
+.hp-track { height: 7px; background: #2c2c33; border-radius: 99px; margin: 6px 0 4px; overflow: hidden; }
+.hp-fill { height: 100%; background: var(--ok); border-radius: 99px; transition: width 0.5s var(--ease-out), background-color 0.3s; }
+.hp-fill.mid { background: var(--warn); }
+.hp-fill.low { background: var(--err); }
+.hp-num { color: var(--muted); text-align: right; font-variant-numeric: tabular-nums; }
+
+.battle-log {
+  margin-top: 12px; background: var(--surface); border: 2px solid var(--border); border-radius: 14px;
+  padding: 14px; min-height: 58px; font-weight: 700; animation: rise 0.25s var(--ease-out) both;
+}
+
+/* Animaciones de combate. */
+.idle { animation: bob 1.6s ease-in-out infinite; }
+.sprite.flip.idle { animation-name: bob-flip; }
+@keyframes bob { 50% { transform: translateY(-4px); } }
+@keyframes bob-flip { 0%, 100% { transform: scaleX(-1); } 50% { transform: scaleX(-1) translateY(-4px); } }
+.lunge0 { animation: lunge0 0.42s var(--ease-out); }
+.lunge1 { animation: lunge1 0.42s var(--ease-out); }
+@keyframes lunge0 { 0%, 100% { transform: scaleX(-1); } 45% { transform: scaleX(-1) translate(-46px, -22px); } }
+@keyframes lunge1 { 45% { transform: translate(-46px, 22px); } }
+.hit { animation: hit 0.5s steps(2) 2; }
+.sprite.flip.hit { animation-name: hit-flip; }
+@keyframes hit { 50% { opacity: 0.15; filter: brightness(3); } }
+@keyframes hit-flip { 0%, 100% { transform: scaleX(-1); } 50% { transform: scaleX(-1); opacity: 0.15; filter: brightness(3); } }
+.ko { animation: ko 0.7s var(--ease-out) forwards; }
+.sprite.flip.ko { animation-name: ko-flip; }
+@keyframes ko { to { transform: translateY(40px); opacity: 0; filter: grayscale(1); } }
+@keyframes ko-flip { to { transform: scaleX(-1) translateY(40px); opacity: 0; filter: grayscale(1); } }
+.win { animation: win 0.6s var(--spring) 3; }
+.sprite.flip.win { animation-name: win-flip; }
+@keyframes win { 50% { transform: translateY(-18px); } }
+@keyframes win-flip { 0%, 100% { transform: scaleX(-1); } 50% { transform: scaleX(-1) translateY(-18px); } }
+.revive { animation: revive 0.9s ease-out; }
+@keyframes revive { 0% { filter: brightness(4) drop-shadow(0 0 12px #c9b8ff); opacity: 0.3; } 100% { filter: none; opacity: 1; } }
+.dmg {
+  position: absolute; top: 10px; left: 50%; transform: translateX(-50%); font-weight: 900; font-size: 1.3rem;
+  color: #fff; text-shadow: 0 2px 0 #000; animation: dmg 0.9s var(--ease-out) forwards; pointer-events: none;
+}
+.dmg.crit { color: var(--warn); font-size: 1.7rem; }
+@keyframes dmg { 0% { opacity: 0; transform: translate(-50%, 10px) scale(0.6); } 20% { opacity: 1; transform: translate(-50%, -6px) scale(1.15); } 100% { opacity: 0; transform: translate(-50%, -34px); } }
+.shake { animation: shake 0.35s; }
+
+.promo {
+  display: flex; align-items: center; gap: 12px; background: linear-gradient(120deg, #2b2450, #1f1d33);
+  border: 1px solid #3b3366; border-radius: var(--radius); padding: 14px; color: var(--text); margin-top: 4px;
+}
+.promo .sprite { width: 56px; height: 56px; }
+.promo strong { display: block; }
+/* La franja degradada del botón fijo no debe bloquear toques. */
+.cta-bar { pointer-events: none; }
+.cta-bar .inner { pointer-events: auto; }
+.shell { padding-bottom: 160px; }
+.coin-logo { border-radius: 50%; object-fit: cover; flex-shrink: 0; background: var(--surface-2); }

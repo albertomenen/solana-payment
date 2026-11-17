@@ -39,6 +39,10 @@ pub mod wager {
         instructions::arbiter_resolve(ctx, outcome)
     }
 
+    pub fn resolve_with_price(ctx: Context<ResolveWithPrice>) -> Result<()> {
+        instructions::resolve_with_price(ctx)
+    }
+
     pub fn settle(ctx: Context<Settle>) -> Result<()> {
         instructions::settle(ctx)
     }

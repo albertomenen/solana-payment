@@ -30,4 +30,16 @@ pub enum WagerError {
     InvalidTokenAccount,
     #[msg("Desbordamiento aritmético")]
     Overflow,
+    #[msg("Esta apuesta la resuelve el oráculo, no se vota")]
+    OracleBet,
+    #[msg("Esta apuesta no tiene condición de precio")]
+    NotAnOracleBet,
+    #[msg("El precio no corresponde al momento acordado")]
+    WrongPriceTime,
+    #[msg("El precio no es del activo acordado")]
+    WrongPriceFeed,
+    #[msg("El precio de Pyth no está totalmente verificado")]
+    UnverifiedPrice,
+    #[msg("Condición de precio inválida")]
+    InvalidCondition,
 }

@@ -36,8 +36,11 @@ const IX = {
   arbiterResolve: [72, 74, 145, 98, 97, 32, 107, 5],
   settle: [175, 42, 185, 87, 144, 131, 102, 212],
   refundExpired: [118, 153, 164, 244, 40, 128, 242, 250],
+  resolveWithPrice: [147, 185, 42, 9, 42, 21, 90, 38],
 };
 const BET_DISCRIMINATOR = new Uint8Array([147, 23, 35, 59, 15, 75, 155, 32]);
+/** Tamaño de la cuenta Bet (8 + Bet::INIT_SPACE). Las de versiones anteriores no coinciden. */
+const BET_SIZE = 469;
 
 /** Mensajes de `programs/wager/src/errors.rs` (códigos 6000+). */
 export const PROGRAM_ERRORS = [
@@ -55,7 +58,22 @@ export const PROGRAM_ERRORS = [
   "El árbitro no puede ser uno de los participantes",
   "Cuenta de token incorrecta",
   "Desbordamiento aritmético",
+  "Esta apuesta la resuelve el oráculo, no se vota",
+  "Esta apuesta no tiene condición de precio",
+  "El precio no corresponde al momento acordado",
+  "El precio no es del activo acordado",
+  "El precio de Pyth no está totalmente verificado",
+  "Condición de precio inválida",
 ];
+
+/** Condición de precio que resuelve el oráculo de Pyth. */
+export interface PriceCondition {
+  feedId: Uint8Array; // 32 bytes
+  threshold: bigint; // precio = threshold * 10^expo
+  expo: number;
+  above: boolean; // true: gana el creador si el precio es mayor que el umbral
+  resolveAt: number; // unix
+}
 
 // ---------- Borsh ----------
 
@@ -72,6 +90,18 @@ class Writer {
     const b = new Uint8Array(8);
     new DataView(b.buffer).setBigUint64(0, v, true);
     return this.raw(b);
+  }
+  i32(v: number) {
+    const b = new Uint8Array(4);
+    new DataView(b.buffer).setInt32(0, v, true);
+    return this.raw(b);
+  }
+  bool(v: boolean) {
+    return this.u8(v ? 1 : 0);
+  }
+  optCondition(c: PriceCondition | null) {
+    if (!c) return this.u8(0);
+    return this.u8(1).raw(c.feedId).i64(c.threshold).i32(c.expo).bool(c.above).i64(BigInt(c.resolveAt));
   }
   i64(v: bigint) {
     const b = new Uint8Array(8);
@@ -105,6 +135,26 @@ class Reader {
     const v = this.view.getBigUint64(this.o, true);
     this.o += 8;
     return v;
+  }
+  i32() {
+    const v = this.view.getInt32(this.o, true);
+    this.o += 4;
+    return v;
+  }
+  bytes(n: number) {
+    const v = this.b.slice(this.o, this.o + n);
+    this.o += n;
+    return v;
+  }
+  optCondition(): PriceCondition | null {
+    if (!this.u8()) return null;
+    return {
+      feedId: this.bytes(32),
+      threshold: this.i64(),
+      expo: this.i32(),
+      above: this.u8() === 1,
+      resolveAt: Number(this.i64()),
+    };
   }
   i64() {
     const v = this.view.getBigInt64(this.o, true);
@@ -148,6 +198,7 @@ export interface Bet {
   acceptorVote: Outcome | null;
   outcome: Outcome | null;
   status: BetStatus;
+  condition: PriceCondition | null;
   description: string;
 }
 
@@ -155,6 +206,7 @@ export function decodeBet(address: PublicKey, data: Uint8Array): Bet {
   for (let i = 0; i < 8; i++) {
     if (data[i] !== BET_DISCRIMINATOR[i]) throw new Error("No es una cuenta Bet");
   }
+  if (data.length !== BET_SIZE) throw new Error("Apuesta de una versión anterior del programa");
   const r = new Reader(data.subarray(8));
   const bet = {
     address,
@@ -174,7 +226,8 @@ export function decodeBet(address: PublicKey, data: Uint8Array): Bet {
   };
   r.u8(); // bump
   r.u8(); // vault_bump
-  return { ...bet, description: r.string() };
+  const condition = r.optCondition();
+  return { ...bet, condition, description: r.string() };
 }
 
 export async function fetchBet(conn: Connection, address: PublicKey) {
@@ -184,9 +237,16 @@ export async function fetchBet(conn: Connection, address: PublicKey) {
 
 export async function fetchAllBets(conn: Connection): Promise<Bet[]> {
   const accounts = await conn.getProgramAccounts(PROGRAM_ID, {
-    filters: [{ memcmp: { offset: 0, bytes: bs58.encode(BET_DISCRIMINATOR) } }],
+    filters: [{ dataSize: BET_SIZE }, { memcmp: { offset: 0, bytes: bs58.encode(BET_DISCRIMINATOR) } }],
   });
-  return accounts.map((a) => decodeBet(a.pubkey, a.account.data));
+  // Las apuestas creadas con versiones antiguas del programa se ignoran.
+  return accounts.flatMap((a) => {
+    try {
+      return [decodeBet(a.pubkey, a.account.data)];
+    } catch {
+      return [];
+    }
+  });
 }
 
 // ---------- PDAs ----------
@@ -231,6 +291,7 @@ export interface CreateBetParams {
   arbiter: PublicKey | null;
   acceptDeadline: number;
   resolveDeadline: number;
+  condition: PriceCondition | null;
 }
 
 export function createBetIx(p: CreateBetParams) {
@@ -244,6 +305,7 @@ export function createBetIx(p: CreateBetParams) {
     .optPubkey(p.arbiter)
     .i64(BigInt(p.acceptDeadline))
     .i64(BigInt(p.resolveDeadline))
+    .optCondition(p.condition)
     .done();
   return {
     bet,
@@ -301,6 +363,14 @@ export function arbiterResolveIx(bet: Bet, arbiter: PublicKey, outcome: Outcome)
   return ix(
     [m(arbiter, true, false), m(bet.address, false, true)],
     new Writer().raw(IX.arbiterResolve).u8(outcome).done(),
+  );
+}
+
+/** Resuelve una apuesta de precio con una cuenta de precio de Pyth ya publicada. */
+export function resolveWithPriceIx(bet: Bet, priceUpdate: PublicKey) {
+  return ix(
+    [m(bet.address, false, true), m(priceUpdate, false, false)],
+    new Writer().raw(IX.resolveWithPrice).done(),
   );
 }
 

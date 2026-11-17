@@ -1,12 +1,15 @@
 //! Tests de integración: ejecutan el programa completo (compilado de forma
 //! nativa) sobre un banco local de `solana-program-test`, con el programa SPL
 //! Token real.
+use anchor_lang::AccountSerialize;
 use anchor_lang::{
     prelude::{AccountInfo, Clock, Pubkey},
     solana_program::{entrypoint::ProgramResult, instruction::Instruction},
     AccountDeserialize, InstructionData, ToAccountMetas,
 };
 use anchor_spl::token::spl_token;
+use pyth_solana_receiver_sdk::price_update::{PriceFeedMessage, PriceUpdateV2, VerificationLevel};
+use solana_account::AccountSharedData;
 use solana_keypair::Keypair;
 use solana_program_test::{processor, BanksClientError, ProgramTest, ProgramTestContext};
 use solana_signer::Signer;
@@ -15,7 +18,7 @@ use solana_transaction::Transaction;
 use wager::{
     errors::WagerError,
     instructions::CreateBetArgs,
-    state::{Bet, BetStatus, Outcome, BET_SEED, VAULT_SEED},
+    state::{Bet, BetStatus, Outcome, PriceCondition, BET_SEED, PRICE_WINDOW, VAULT_SEED},
 };
 
 /// Comprueba que la transacción falló con el error esperado (no por otro motivo).
@@ -339,6 +342,19 @@ impl Env {
         arbiter: Option<Pubkey>,
     ) -> Result<Pubkey, BanksClientError> {
         let now = self.now().await;
+        self.create_bet_with(bet_id, opponent, arbiter, now + HOUR, now + 10 * HOUR, None)
+            .await
+    }
+
+    async fn create_bet_with(
+        &mut self,
+        bet_id: u64,
+        opponent: Option<Pubkey>,
+        arbiter: Option<Pubkey>,
+        accept_deadline: i64,
+        resolve_deadline: i64,
+        condition: Option<PriceCondition>,
+    ) -> Result<Pubkey, BanksClientError> {
         let (bet, vault) = self.pdas(bet_id);
         let ix = Instruction {
             program_id: wager::ID,
@@ -359,8 +375,9 @@ impl Env {
                     stake: STAKE,
                     opponent,
                     arbiter,
-                    accept_deadline: now + HOUR,
-                    resolve_deadline: now + 10 * HOUR,
+                    accept_deadline,
+                    resolve_deadline,
+                    condition,
                 },
             }
             .data(),
@@ -451,6 +468,54 @@ impl Env {
         };
         let creator = self.creator.insecure_clone();
         self.send(&[ix], &[&creator]).await
+    }
+
+    /// Crea una cuenta de precio de Pyth como la que publicaría su receptor.
+    fn set_price(
+        &mut self,
+        feed_id: [u8; 32],
+        price: i64,
+        prev_publish_time: i64,
+        publish_time: i64,
+        level: VerificationLevel,
+        owner: Pubkey,
+    ) -> Pubkey {
+        let update = PriceUpdateV2 {
+            write_authority: Pubkey::new_unique(),
+            verification_level: level,
+            price_message: PriceFeedMessage {
+                feed_id,
+                price,
+                conf: 1,
+                exponent: -8,
+                publish_time,
+                prev_publish_time,
+                ema_price: price,
+                ema_conf: 1,
+            },
+            posted_slot: 1,
+        };
+        let mut data = vec![];
+        update.try_serialize(&mut data).unwrap();
+        let address = Pubkey::new_unique();
+        let mut account = AccountSharedData::new(1_000_000_000, data.len(), &owner);
+        account.set_data_from_slice(&data);
+        self.ctx.set_account(&address, &account);
+        address
+    }
+
+    async fn resolve_with_price(
+        &mut self,
+        bet: Pubkey,
+        price_update: Pubkey,
+    ) -> Result<(), BanksClientError> {
+        let ix = Instruction {
+            program_id: wager::ID,
+            accounts: wager::accounts::ResolveWithPrice { bet, price_update }
+                .to_account_metas(None),
+            data: wager::instruction::ResolveWithPrice {}.data(),
+        };
+        self.send(&[ix], &[]).await
     }
 
     fn settle_ix(
@@ -687,4 +752,244 @@ async fn creator_cannot_accept_own_bet() {
         env.accept_bet_as(bet, &creator, token).await,
         code(WagerError::CannotAcceptOwnBet),
     );
+}
+
+// ---------------- Oráculo de precios (Pyth) ----------------
+
+const SOL_FEED: [u8; 32] = [7; 32];
+const PYTH: Pubkey = pyth_solana_receiver_sdk::ID;
+
+/// Apuesta "SOL por encima de 300 $ dentro de 2 horas", aceptada.
+async fn matched_price_bet(env: &mut Env, bet_id: u64) -> (Pubkey, i64) {
+    let now = env.now().await;
+    let resolve_at = now + 2 * HOUR;
+    let cond = PriceCondition {
+        feed_id: SOL_FEED,
+        threshold: 300 * 100_000_000,
+        expo: -8,
+        above: true,
+        resolve_at,
+    };
+    let bet = env
+        .create_bet_with(
+            bet_id,
+            None,
+            None,
+            now + HOUR,
+            resolve_at + 24 * HOUR,
+            Some(cond),
+        )
+        .await
+        .unwrap();
+    env.accept_bet(bet).await.unwrap();
+    (bet, resolve_at)
+}
+
+#[tokio::test]
+async fn price_bet_is_resolved_by_pyth_and_paid() {
+    let mut env = Env::new().await;
+    let (bet, t) = matched_price_bet(&mut env, 20).await;
+
+    // No se vota: decide el oráculo.
+    let creator = env.creator.insecure_clone();
+    assert_err(
+        env.vote(bet, &creator, Outcome::CreatorWins).await,
+        code(WagerError::OracleBet),
+    );
+
+    env.warp_to(t + 30).await;
+    let price = env.set_price(
+        SOL_FEED,
+        310 * 100_000_000,
+        t - 1,
+        t,
+        VerificationLevel::Full,
+        PYTH,
+    );
+    env.resolve_with_price(bet, price).await.unwrap();
+    let b = env.bet(bet).await;
+    assert_eq!(b.status, BetStatus::Resolved);
+    assert_eq!(b.outcome, Some(Outcome::CreatorWins));
+
+    env.settle(bet).await.unwrap();
+    assert_eq!(env.balance(env.creator_token).await, INITIAL + STAKE);
+    assert_eq!(env.balance(env.acceptor_token).await, INITIAL - STAKE);
+}
+
+#[tokio::test]
+async fn price_below_threshold_pays_acceptor() {
+    let mut env = Env::new().await;
+    let (bet, t) = matched_price_bet(&mut env, 21).await;
+    env.warp_to(t + 5).await;
+    let price = env.set_price(
+        SOL_FEED,
+        250 * 100_000_000,
+        t - 1,
+        t + 2,
+        VerificationLevel::Full,
+        PYTH,
+    );
+    env.resolve_with_price(bet, price).await.unwrap();
+    assert_eq!(env.bet(bet).await.outcome, Some(Outcome::AcceptorWins));
+}
+
+#[tokio::test]
+async fn pyth_resolution_rejects_bad_prices() {
+    let mut env = Env::new().await;
+    let (bet, t) = matched_price_bet(&mut env, 22).await;
+    env.warp_to(t + 120).await;
+    let p = 310 * 100_000_000;
+
+    // Precio anterior a la hora acordada o fuera de la ventana.
+    let earlier = env.set_price(SOL_FEED, p, t - 5, t - 1, VerificationLevel::Full, PYTH);
+    assert_err(
+        env.resolve_with_price(bet, earlier).await,
+        code(WagerError::WrongPriceTime),
+    );
+    let too_late = env.set_price(
+        SOL_FEED,
+        p,
+        t,
+        t + PRICE_WINDOW + 1,
+        VerificationLevel::Full,
+        PYTH,
+    );
+    assert_err(
+        env.resolve_with_price(bet, too_late).await,
+        code(WagerError::WrongPriceTime),
+    );
+
+    // Otro activo.
+    let btc = env.set_price([9; 32], p, t - 1, t, VerificationLevel::Full, PYTH);
+    assert_err(
+        env.resolve_with_price(bet, btc).await,
+        code(WagerError::WrongPriceFeed),
+    );
+
+    // Verificación parcial.
+    let partial = env.set_price(
+        SOL_FEED,
+        p,
+        t - 1,
+        t,
+        VerificationLevel::Partial { num_signatures: 5 },
+        PYTH,
+    );
+    assert_err(
+        env.resolve_with_price(bet, partial).await,
+        code(WagerError::UnverifiedPrice),
+    );
+
+    // Cuenta falsificada por alguien que no es el receptor de Pyth.
+    let fake = env.set_price(
+        SOL_FEED,
+        p,
+        t - 1,
+        t,
+        VerificationLevel::Full,
+        Pubkey::new_unique(),
+    );
+    assert_err(
+        env.resolve_with_price(bet, fake).await,
+        anchor_lang::error::ErrorCode::AccountOwnedByWrongProgram as u32,
+    );
+
+    assert_eq!(env.bet(bet).await.status, BetStatus::Matched);
+}
+
+#[tokio::test]
+async fn price_bet_creation_rules() {
+    let mut env = Env::new().await;
+    let now = env.now().await;
+    let cond = PriceCondition {
+        feed_id: SOL_FEED,
+        threshold: 1,
+        expo: -8,
+        above: true,
+        resolve_at: now + HOUR,
+    };
+
+    // Aceptar después de conocer el precio no está permitido.
+    let res = env
+        .create_bet_with(30, None, None, now + 2 * HOUR, now + 30 * HOUR, Some(cond))
+        .await;
+    assert_err(res, code(WagerError::InvalidDeadlines));
+    // La ventana de resolución debe caber antes de resolve_deadline.
+    let res = env
+        .create_bet_with(31, None, None, now + 60, now + HOUR + 60, Some(cond))
+        .await;
+    assert_err(res, code(WagerError::InvalidDeadlines));
+    // Sin árbitro: decide el oráculo.
+    let arbiter = Some(env.arbiter.pubkey());
+    let res = env
+        .create_bet_with(32, None, arbiter, now + 60, now + 30 * HOUR, Some(cond))
+        .await;
+    assert_err(res, code(WagerError::OracleBet));
+
+    // Las apuestas normales no se pueden resolver con Pyth.
+    let bet = env.create_bet(33, None, None).await.unwrap();
+    env.accept_bet(bet).await.unwrap();
+    let t = env.now().await;
+    let price = env.set_price(SOL_FEED, 1, t - 1, t, VerificationLevel::Full, PYTH);
+    assert_err(
+        env.resolve_with_price(bet, price).await,
+        code(WagerError::NotAnOracleBet),
+    );
+}
+
+#[tokio::test]
+async fn unresolved_price_bet_is_refunded() {
+    let mut env = Env::new().await;
+    let (bet, _) = matched_price_bet(&mut env, 23).await;
+    let deadline = env.bet(bet).await.resolve_deadline;
+    env.warp_to(deadline + 1).await;
+    env.refund_expired(bet).await.unwrap();
+    assert_eq!(env.balance(env.creator_token).await, INITIAL);
+    assert_eq!(env.balance(env.acceptor_token).await, INITIAL);
+}
+
+#[tokio::test]
+async fn first_price_in_window_is_final() {
+    let mut env = Env::new().await;
+    let (bet, t) = matched_price_bet(&mut env, 24).await;
+    env.warp_to(t + 200).await;
+    // Primer precio publicado tras la hora acordada: gana el rival.
+    let low = env.set_price(
+        SOL_FEED,
+        290 * 100_000_000,
+        t + 50,
+        t + 90,
+        VerificationLevel::Full,
+        PYTH,
+    );
+    env.resolve_with_price(bet, low).await.unwrap();
+    // Un precio posterior que favorecería al creador ya no cambia nada.
+    let high = env.set_price(
+        SOL_FEED,
+        320 * 100_000_000,
+        t + 150,
+        t + 180,
+        VerificationLevel::Full,
+        PYTH,
+    );
+    assert_err(
+        env.resolve_with_price(bet, high).await,
+        code(WagerError::InvalidStatus),
+    );
+    assert_eq!(env.bet(bet).await.outcome, Some(Outcome::AcceptorWins));
+}
+
+#[tokio::test]
+async fn price_bet_refunds_right_after_the_window() {
+    let mut env = Env::new().await;
+    let (bet, t) = matched_price_bet(&mut env, 25).await;
+    env.warp_to(t + PRICE_WINDOW).await;
+    assert_err(
+        env.refund_expired(bet).await,
+        code(WagerError::ResolveDeadlineNotReached),
+    );
+    env.warp_to(t + PRICE_WINDOW + 1).await;
+    env.refund_expired(bet).await.unwrap();
+    assert_eq!(env.balance(env.creator_token).await, INITIAL);
+    assert_eq!(env.balance(env.acceptor_token).await, INITIAL);
 }
